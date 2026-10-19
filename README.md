@@ -6,6 +6,10 @@ Little mods I've made for Claude Code. Free to use, MIT licensed.
 
 <sub>usage-radar at the bottom while Claude works, turn-receipt on the right when it's done.</sub>
 
+| usage-radar `/radar` | turn-receipt `/receipt` |
+|---|---|
+| ![usage-radar panel](usage-radar/docs/agents-panel.png) | ![turn-receipt](turn-receipt/docs/receipt.png) |
+
 ## What's here
 
 **[usage-radar](./usage-radar)**: a live readout while Claude works. Model, tokens, cost, a timer, how full the context is, and your 5-hour / weekly limits if your plan reports them. It pops a warning at 80% and 95%. `/radar` opens a panel with every agent and what each one is costing you.
