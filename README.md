@@ -1,69 +1,54 @@
 # claude-mods
 
-**Free, open mods for [Claude Code](https://claude.com/claude-code).** Each one changes how Claude Code looks or works, and installs with one command.
+Little mods I've made for Claude Code. Free to use, MIT licensed.
 
-![Usage Radar](usage-radar/docs/agents-panel.png)
+![Turn Receipt](turn-receipt/docs/receipt.png)
 
-## Mods
+## What's here
 
-| Mod | What it does | Install (inside Claude Code) |
-|---|---|---|
-| [**Usage Radar**](./usage-radar) | Live plan limits (5-hour, weekly) and context with 80% / 95% alerts, plus cost, tokens, timer and a per-agent panel (`/radar`) | `/plugin install usage-radar --marketplace Tejas274/claude-mods` |
-| [**Turn Receipt** 🧾](./turn-receipt) | An itemized receipt for every job: per agent, per tool, slowest step, biggest read, files changed, cache hit. `/receipt` to view, `/receipt copy` to share | `/plugin install turn-receipt --marketplace Tejas274/claude-mods` |
+**[usage-radar](./usage-radar)**: a live readout while Claude works. Model, tokens, cost, a timer, how full the context is, and your 5-hour / weekly limits if your plan reports them. It pops a warning at 80% and 95%. `/radar` opens a panel with every agent and what each one is costing you.
 
-More coming soon.
+**[turn-receipt](./turn-receipt)**: when a job finishes you get a receipt. Which agents ran, how long each took, what they cost, which tools were used, the slowest step, the biggest file read, cache hit rate. `/receipt` to look at it, `/receipt copy` to paste it somewhere.
+
+They work fine together. Radar is for *during*, receipt is for *after*.
 
 ## Install
 
-**Inside Claude Code:** copy the install line from the table. Answer `y` to add the marketplace, choose **user** scope, and restart Claude Code.
+In Claude Code:
 
-**From your terminal:** add the marketplace once, then install any mod:
+```
+/plugin install usage-radar --marketplace Tejas274/claude-mods
+/plugin install turn-receipt --marketplace Tejas274/claude-mods
+```
+
+Say `y` when it asks to add the marketplace and pick **user** so it's on in every project. Restart Claude Code.
+
+Or from a terminal:
 
 ```bash
 claude plugin marketplace add Tejas274/claude-mods
-claude plugin install usage-radar@claude-mods
+claude plugin install usage-radar@claude-mods --scope user
+claude plugin install turn-receipt@claude-mods --scope user
 ```
 
-**Update:** run `/plugin`, open **Marketplaces**, and update `claude-mods`.
-**Remove:** `/plugin uninstall <mod-name>`.
+To update later: `/plugin` → Marketplaces → update `claude-mods`. To remove one: `/plugin uninstall <name>`.
 
-## What's a mod?
+You need a recent Claude Code; mods are a new feature.
 
-A mod is a small piece of code that plugs into Claude Code's events: when you send a prompt, when Claude uses a tool, when an agent starts or finishes. It can **watch** them, **change** them, **block** them, or **draw** something new on screen (a status line, a band above the prompt, a side panel, a pop-up).
+## What's a mod, anyway?
 
-Mods only see what Claude Code gives them. Each mod's README says exactly what it reads and whether it sends anything anywhere.
+A small TypeScript file that hooks into Claude Code's events (you sending a prompt, Claude running a tool, an agent finishing) and can watch them, change them, block them, or draw something on screen. These two only watch. Nothing leaves your machine.
 
-## Make your own
+## Making your own
 
-1. Copy [`template/`](./template) and rename it, for example `my-mod/`.
-2. In `my-mod/.claude-plugin/plugin.json`, set `"name": "my-mod"` and a description.
-3. Run it live (saving a file reloads it):
-   ```bash
-   claude --plugin-dir ./my-mod
-   ```
-4. Check it:
-   ```bash
-   claude plugin validate my-mod
-   claude plugin test my-mod
-   ```
-5. Add it to [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and to the table above.
-6. Publish: `./publish.sh "Add my-mod"`.
+There's a starter in [`template/`](./template). Copy it, rename it, change the name in `.claude-plugin/plugin.json`, then:
 
-## Repo layout
-
-```
-claude-mods/
-├── .claude-plugin/marketplace.json   ← the list of mods
-├── usage-radar/                      ← one folder per mod
-├── template/                         ← starting point for a new mod
-├── publish.sh                        ← validate + commit + push
-└── README.md
+```bash
+claude --plugin-dir ./my-mod      # reloads every time you save
+claude plugin validate my-mod
+claude plugin test my-mod
 ```
 
-## Contributing
+When it works, add it to `.claude-plugin/marketplace.json` and run `./publish.sh "add my-mod"`.
 
-Ideas, bugs and new mods are welcome: open an issue or a pull request.
-
-## License
-
-[MIT](LICENSE): free to use, change and share.
+Issues and PRs welcome.
