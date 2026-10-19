@@ -1,0 +1,9 @@
+{
+  "name": "my-new-mod",
+  "version": "0.1.0",
+  "description": "One line about what this mod does",
+  "author": {
+    "name": "Tejas Shah"
+  },
+  "license": "MIT"
+}

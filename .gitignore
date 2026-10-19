@@ -1,0 +1,9 @@
+.DS_Store
+*.log
+*.zip
+old-steps/
+**/.claude-plugin/types/
+.mcpb-cache/
+# leftover from when savvy-progress was its own repo
+savvy-progress/.claude-plugin/marketplace.json
+*.tmp
