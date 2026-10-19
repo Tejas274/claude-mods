@@ -14,7 +14,7 @@ Pick **user** scope, restart Claude Code. Or: `claude plugin marketplace add Tej
 
 ## Using it
 
-When a job is done (including any helper agents still running in the background) you'll get a toast like `🧾 Receipt #42 · 1:24 · 23 steps · 3 agents · ≈$0.47`.
+When a job is done (including any helper agents still running in the background) you'll get a toast like `🧾 Receipt #1 · 0:48 · 19 steps · 3 agents · ≈$0.36`.
 
 - `/receipt`: open it
 - `/receipt copy`: copy it as plain text, handy for Slack or a PR description

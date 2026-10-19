@@ -1,6 +1,6 @@
 # usage-radar
 
-I kept running out of context (and hitting the 5-hour limit) without seeing it coming, so I built this. It sits above the prompt and shows what's going on while Claude works.
+Shows what's going on while Claude works, right above the prompt: context fill, cost, tokens, time, every agent, and your 5-hour / weekly limits when your account reports them.
 
 ![band](docs/band.png)
 
