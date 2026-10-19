@@ -43,4 +43,6 @@ fi
 echo
 echo "Done! https://github.com/$REPO"
 echo "Anyone can now install:"
-echo "  /plugin install savvy-progress --marketplace $REPO"
+for name in $(python3 -c "import json;print(' '.join(p['name'] for p in json.load(open('.claude-plugin/marketplace.json'))['plugins']))"); do
+  echo "  /plugin install $name --marketplace $REPO"
+done
