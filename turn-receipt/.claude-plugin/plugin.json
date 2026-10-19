@@ -1,0 +1,8 @@
+{
+  "name": "turn-receipt",
+  "version": "1.0.0",
+  "description": "An itemized receipt for every Claude Code job: time and cost per agent, calls and time per tool, the slowest step, the biggest read, files changed and cache hits. /receipt to view, /receipt copy to share.",
+  "types": "./types/index.d.ts",
+  "author": { "name": "Tejas Shah" },
+  "license": "MIT"
+}

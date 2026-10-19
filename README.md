@@ -9,6 +9,7 @@
 | Mod | What it does | Install (inside Claude Code) |
 |---|---|---|
 | [**Savvy Progress**](./savvy-progress) | Live model, tokens, cost and timer above the prompt, a status line, and an Agents panel with per-agent cost (`/savvy`) | `/plugin install savvy-progress --marketplace Tejas274/claude-mods` |
+| [**Turn Receipt** 🧾](./turn-receipt) | An itemized receipt for every job: per agent, per tool, slowest step, biggest read, files changed, cache hit. `/receipt` to view, `/receipt copy` to share | `/plugin install turn-receipt --marketplace Tejas274/claude-mods` |
 
 More coming soon.
 

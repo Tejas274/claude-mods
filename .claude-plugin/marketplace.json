@@ -1,12 +1,19 @@
 {
   "name": "claude-mods",
-  "owner": { "name": "Tejas Shah" },
+  "owner": {
+    "name": "Tejas Shah"
+  },
   "description": "Free, open mods for Claude Code. Install any of them with one command.",
   "plugins": [
     {
       "name": "savvy-progress",
       "source": "./savvy-progress",
       "description": "Live progress: model, tokens, cost, timer and to-do bar above the prompt, a status line, and an Agents panel (/savvy)."
+    },
+    {
+      "name": "turn-receipt",
+      "source": "./turn-receipt",
+      "description": "An itemized receipt for every job: time and cost per agent, calls and time per tool, slowest step, biggest read, files changed, cache hit. /receipt, /receipt copy."
     }
   ]
 }
