@@ -2,11 +2,9 @@
 
 Little mods I've made for Claude Code. Free to use, MIT licensed.
 
-| usage-radar (while Claude works) | turn-receipt (when it's done) |
-|---|---|
-| ![usage-radar panel](usage-radar/docs/agents-panel.png) | ![turn-receipt](turn-receipt/docs/receipt.png) |
+![usage-radar and turn-receipt in Claude Code](docs/hero.png)
 
-![usage-radar band above the prompt](usage-radar/docs/band.png)
+<sub>usage-radar at the bottom while Claude works, turn-receipt on the right when it's done.</sub>
 
 ## What's here
 
