@@ -1,44 +1,33 @@
 # turn-receipt 🧾
 
-After every job, Claude Code prints you a receipt. Which agents ran and what each cost, which tools got used and how long they took, the slowest step, the biggest read, the files it changed, and how much came from cache.
+when claude finishes a job you get a receipt for it.
 
 ![receipt](docs/receipt.png)
 
-## Install
+install (inside claude code):
 
 ```
 /plugin install turn-receipt --marketplace Tejas274/claude-mods
 ```
 
-Pick **user** scope, restart Claude Code. Or: `claude plugin marketplace add Tejas274/claude-mods && claude plugin install turn-receipt@claude-mods --scope user`
+say `y`, pick user scope, restart. or from the terminal: `claude plugin marketplace add Tejas274/claude-mods && claude plugin install turn-receipt@claude-mods --scope user`
 
-## Using it
+### how it works
 
-When a job is done (including any helper agents still running in the background) you'll get a toast like `🧾 Receipt #1 · 0:48 · 19 steps · 3 agents · ≈$0.36`.
+once the whole job is done (helpers included) a toast pops up, something like `🧾 Receipt #1 · 0:48 · 19 steps · 3 agents · ≈$0.36`.
 
-- `/receipt`: open it
-- `/receipt copy`: copy it as plain text, handy for Slack or a PR description
+`/receipt` opens it. `/receipt copy` puts it on your clipboard as plain text if you want to paste it in slack or a PR.
 
-## What's on it
+on the receipt: every agent with its model, time and cost, every tool with calls / time / roughly how much text it sent back (failed calls show in red), the slowest step, the biggest read, files changed, cache hit %, and the total.
 
-- **Agents**: each one, its model, how long it ran, its share of the cost
-- **Tools**: calls, total time, and roughly how much text each tool fed back to Claude. Failed calls are marked in red.
-- **Slowest / Biggest**: usually the first thing worth looking at when a job felt slow or pricey
-- **Files changed**, **cache hit %**, and the **total**
+stuff like launching helpers or updating the to-do list doesn't count for slowest/biggest, so those point at actual work.
 
-Bookkeeping stuff (spawning helpers, to-do updates) is left out of slowest/biggest so they point at real work.
+### about the numbers
 
-## Notes
+the total is the real cost for the job (same as `/cost`) when claude code reports one. per-agent cost is an estimate. "~tokens" per tool is a rough guess, about 4 characters per token.
 
-- The total is the real cost for the job (same source as `/cost`), when Claude Code reports one. Per-agent costs are an estimate.
-- "~tokens" per tool is a rough size estimate (about 4 characters per token).
-- Nothing is sent anywhere. `/receipt copy` only touches your clipboard.
+nothing is sent anywhere, `/receipt copy` only touches your clipboard.
 
-## Hacking on it
-
-```bash
-claude --plugin-dir ./turn-receipt
-claude plugin test turn-receipt
-```
+to hack on it: `claude --plugin-dir ./turn-receipt`, code is in `hooks/register.tsx`.
 
 MIT

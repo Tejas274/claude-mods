@@ -1,31 +1,27 @@
 # claude-mods
 
-Little mods I've made for Claude Code. Free to use, MIT licensed.
+made these while figuring out how claude code mods work. two so far.
 
 ![usage-radar and turn-receipt in Claude Code](docs/hero.png)
 
-<sub>`/radar` on the left, `/receipt` on the right, the radar band along the bottom.</sub>
+**usage-radar** sits above the prompt and shows what's happening while claude works: model, tokens, cost, time, context, and the 5h/weekly limits if your plan reports them (mine doesn't, so I only get context). warns you at 80% and 95%. `/radar` opens a panel with every agent and roughly what each one costs.
 
-## What's here
+**turn-receipt** prints a receipt when a job is done. agents, tools, slowest step, biggest read, files changed, cache hits, total cost. `/receipt` shows it, `/receipt copy` copies it as text.
 
-**[usage-radar](./usage-radar)**: a live readout while Claude works. Model, tokens, cost, a timer, how full the context is, and your 5-hour / weekly limits if your plan reports them. It pops a warning at 80% and 95%. `/radar` opens a panel with every agent and what each one is costing you.
+radar is the live view, receipt is the summary after.
 
-**[turn-receipt](./turn-receipt)**: when a job finishes you get a receipt. Which agents ran, how long each took, what they cost, which tools were used, the slowest step, the biggest file read, cache hit rate. `/receipt` to look at it, `/receipt copy` to paste it somewhere.
+### install
 
-They work fine together. Radar is for *during*, receipt is for *after*.
-
-## Install
-
-In Claude Code:
+inside claude code:
 
 ```
 /plugin install usage-radar --marketplace Tejas274/claude-mods
 /plugin install turn-receipt --marketplace Tejas274/claude-mods
 ```
 
-Say `y` when it asks to add the marketplace and pick **user** so it's on in every project. Restart Claude Code.
+say `y` to add the marketplace, pick user scope, restart.
 
-Or from a terminal:
+or from the terminal:
 
 ```bash
 claude plugin marketplace add Tejas274/claude-mods
@@ -33,24 +29,32 @@ claude plugin install usage-radar@claude-mods --scope user
 claude plugin install turn-receipt@claude-mods --scope user
 ```
 
-To update later: `/plugin` → Marketplaces → update `claude-mods`. To remove one: `/plugin uninstall <name>`.
+updating: `/plugin` → marketplaces → update claude-mods. removing: `/plugin uninstall usage-radar` (or turn-receipt).
 
-You need a recent Claude Code; mods are a new feature.
+needs a recent claude code since mods are pretty new.
 
-## What's a mod, anyway?
+for a team: drop this in your repo's `.claude/settings.json` and everyone who opens the project gets both (claude code asks them to trust it once):
 
-A small TypeScript file that hooks into Claude Code's events (you sending a prompt, Claude running a tool, an agent finishing) and can watch them, change them, block them, or draw something on screen. These two only watch. Nothing leaves your machine.
-
-## Making your own
-
-There's a starter in [`template/`](./template). Copy it, rename it, change the name in `.claude-plugin/plugin.json`, then:
-
-```bash
-claude --plugin-dir ./my-mod      # reloads every time you save
-claude plugin validate my-mod
-claude plugin test my-mod
+```json
+{
+  "extraKnownMarketplaces": {
+    "claude-mods": { "source": { "source": "github", "repo": "Tejas274/claude-mods" } }
+  },
+  "enabledPlugins": {
+    "usage-radar@claude-mods": true,
+    "turn-receipt@claude-mods": true
+  }
+}
 ```
 
-When it works, add it to `.claude-plugin/marketplace.json` and run `./publish.sh "add my-mod"`.
+if your company manages claude code settings, an admin might need to allow outside marketplaces first.
 
-Issues and PRs welcome.
+both of these only read what claude code already gives them. nothing gets sent anywhere.
+
+### making one
+
+copy `template/`, rename it, change the name in `.claude-plugin/plugin.json`, then run it with `claude --plugin-dir ./your-mod` (it reloads on save). `claude plugin validate` and `claude plugin test` to check it. add it to `.claude-plugin/marketplace.json` and push.
+
+issues / PRs welcome.
+
+MIT
