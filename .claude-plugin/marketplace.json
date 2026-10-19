@@ -6,9 +6,9 @@
   "description": "Free, open mods for Claude Code. Install any of them with one command.",
   "plugins": [
     {
-      "name": "savvy-progress",
-      "source": "./savvy-progress",
-      "description": "Live progress: model, tokens, cost, timer and to-do bar above the prompt, a status line, and an Agents panel (/savvy)."
+      "name": "usage-radar",
+      "source": "./usage-radar",
+      "description": "Plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, and an agents panel (/radar)."
     },
     {
       "name": "turn-receipt",

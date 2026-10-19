@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, Timer } from 'claude-code'
 
-import type { Agent, Live, Todo } from '../types'
+import type { Agent, Limit, Live, Todo } from '../types'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 1. STATE: everything the screen shows lives in one value. Writing it redraws.
@@ -17,13 +17,15 @@ const EMPTY: Live = {
   window: 200_000,
   agents: [],
   todos: [],
+  limits: [],
+  contextPct: null,
+  alerted: {},
 }
-// (key 'job': a fresh slot, so values saved by the older version are not mixed in)
-const live = atom({ plugin: 'savvy-progress', key: 'job' } as const, EMPTY)
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY)
 
-const PANE = 'savvy-agents'
+const PANE = 'radar-agents'
 // tiles (4) + summary (2) + 3 rows per agent + session total (2), and the dock width
-const paneRows = (agents: number): number => 8 + 3 * Math.max(1, agents)
+const paneRows = (agents: number, limits: number): number => 10 + 2 * limits + 3 * Math.max(1, agents)
 const PANE_COLUMNS = 64
 const TICK_MS = 250
 
@@ -31,6 +33,7 @@ const TICK_MS = 250
 const ORANGE = '#E8803A'
 const AMBER = '#F2B36B'
 const GREEN = '#7BC88F'
+const RED = '#E5616B'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 2. HELPERS: plain functions that only turn data into text (no `$` in here)
@@ -138,6 +141,59 @@ const newJob = (p: Live, now: number, cost: number | null, window: number): Live
   }
 }
 
+// ── Limits & context ────────────────────────────────────────────────────
+const WARN = 80
+const DANGER = 95
+
+const limitLabel = (kind: string): string =>
+  kind === 'five_hour' ? '5h limit' : kind === 'seven_day' ? 'Weekly' : kind === 'spend_limit' ? 'Spend' : kind.replace(/_/g, ' ')
+
+const levelColor = (pctUsed: number): string => (pctUsed >= DANGER ? RED : pctUsed >= WARN ? AMBER : GREEN)
+
+// "2h 10m", "3d 4h", "12m"
+const until = (iso: string | undefined, now: number): string => {
+  if (!iso) return ''
+  const ms = Date.parse(iso) - now
+  if (!(ms > 0)) return 'now'
+  const m = Math.round(ms / 60_000)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h}h ${m % 60}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+// Every meter we watch: plan limits first, then context
+type Meter = { key: string; label: string; pct: number; resetsAt?: string }
+const meters = (p: Live): Meter[] => [
+  ...p.limits.map(l => ({ key: l.kind, label: limitLabel(l.kind), pct: l.percentUsed, resetsAt: l.resetsAt })),
+  ...(p.contextPct === null ? [] : [{ key: 'context', label: 'Context', pct: p.contextPct }]),
+]
+
+// Save the latest limits and context, and work out which alerts to pop (each once per level)
+const withUsage = (
+  p: Live,
+  limits: readonly Limit[],
+  contextPct: number | undefined,
+): { next: Live; alerts: string[] } => {
+  const next: Live = {
+    ...p,
+    limits: limits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
+    contextPct: contextPct ?? p.contextPct,
+  }
+  const alerted = { ...p.alerted }
+  const alerts: string[] = []
+  for (const m of meters(next)) {
+    const level = m.pct >= DANGER ? DANGER : m.pct >= WARN ? WARN : 0
+    if (level > (alerted[m.key] ?? 0)) {
+      const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, p.now)}` : ''
+      const tip = m.key === 'context' ? ' · run /compact soon' : ''
+      alerts.push(`${level >= DANGER ? '⛔' : '⚠'} ${m.label} ${Math.round(m.pct)}% used${reset}${tip}`)
+    }
+    alerted[m.key] = level // drops back to 0 after a reset or /compact, so it can alert again
+  }
+  return { next: { ...next, alerted }, alerts }
+}
+
 // What Claude is doing right now, e.g. "Bash: npm test"
 const describe = (e: { tool: string } & Record<string, unknown>): string => {
   const s = (key: string) => (typeof e[key] === 'string' ? (e[key] as string) : '')
@@ -187,7 +243,9 @@ const statusLine = (p: Live): string => {
   const working = helpers(p).filter(a => a.isRunning).length
   const crew = working ? ` · ${working} helper${working > 1 ? 's' : ''}` : ''
   const icon = p.isRunning ? spinner(p.now) : '✓'
-  return `${icon} ${model}${crew} · ${k(totalTokens(p))} · ${money(jobCost(p))} · ${fit(activity(p), 32)} · ${elapsed(p)}`
+  const worst = [...meters(p)].sort((a, b) => b.pct - a.pct)[0]
+  const gauge = worst ? ` · ${worst.label} ${Math.round(worst.pct)}%` : ''
+  return `${icon} ${model}${crew} · ${k(totalTokens(p))} · ${money(jobCost(p))}${gauge} · ${fit(activity(p), 28)} · ${elapsed(p)}`
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -196,31 +254,37 @@ const statusLine = (p: Live): string => {
 export const register: Register = on => {
   let ticker: Timer | undefined
 
-  // ── Startup: add the /savvy command ─────────────────────────────────────
+  // ── Startup: add the /radar command ─────────────────────────────────────
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'savvy', description: 'Open the Savvy Progress agents panel' })
+    await $.command.register({ name: 'radar', description: 'Open Usage Radar: limits, context, cost and agents' })
     return next(e)
   })
 
-  on('command.run', { command: 'savvy' }, async $ => {
+  on('command.run', { command: 'radar' }, async $ => {
     const p = await read($, live)
-    await $.ui.open({ id: PANE, title: 'Agents', rows: paneRows(p.agents.length), columns: PANE_COLUMNS })
-    return { text: 'Agents panel opened.' }
+    await $.ui.open({ id: PANE, title: 'Usage Radar', rows: paneRows(p.agents.length, meters(p).length), columns: PANE_COLUMNS })
+    return { text: 'Usage Radar opened.' }
   })
 
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
+    if (e.command) return next(e) // slash commands like /radar don't start a new job
     const now = await $.clock.now()
     const usage = await $.session.usage()
     const cost = usage.cost?.usd ?? null
     const window = usage.context.window || 200_000
 
-    const p = await update($, live, p =>
-      anyRunning(p)
+    let alerts: string[] = []
+    const p = await update($, live, p => {
+      const base = anyRunning(p)
         ? withAgent({ ...p, isRunning: true, costUsd: cost ?? p.costUsd }, 'main', a => ({ ...a, isRunning: true }))
-        : newJob(p, now, cost, window),
-    )
+        : newJob(p, now, cost, window)
+      const r = withUsage(base, usage.rateLimits, usage.context.percent)
+      alerts = r.alerts
+      return r.next
+    })
     $.ui.status(statusLine(p))
+    for (const a of alerts) $.ui.toast(a)
 
     // the clock: ticks until the whole job is done
     ticker?.cancel()
@@ -255,7 +319,7 @@ export const register: Register = on => {
 
     // a helper appeared → show the panel, tall enough for every agent
     if (e.agentId) {
-      void $.ui.open({ id: PANE, title: 'Agents', rows: paneRows(after.agents.length), columns: PANE_COLUMNS })
+      void $.ui.open({ id: PANE, title: 'Usage Radar', rows: paneRows(after.agents.length, meters(after).length), columns: PANE_COLUMNS })
     }
 
     return next(e)
@@ -268,8 +332,9 @@ export const register: Register = on => {
     if (u) {
       const id = e.agentId ?? 'main'
       const usage = await $.session.usage()
-      const p = await update($, live, p =>
-        withAgent(
+      let alerts: string[] = []
+      const p = await update($, live, p => {
+        const base = withAgent(
           { ...p, costUsd: usage.cost?.usd ?? p.costUsd, window: usage.context.window || p.window },
           id,
           a => ({
@@ -278,9 +343,13 @@ export const register: Register = on => {
             context: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens,
             units: a.units + unitsOf(u),
           }),
-        ),
-      )
+        )
+        const r = withUsage(base, usage.rateLimits, id === 'main' ? usage.context.percent : undefined)
+        alerts = r.alerts
+        return r.next
+      })
       $.ui.status(statusLine(p))
+      for (const a of alerts) $.ui.toast(a)
     }
     return result
   })
@@ -337,7 +406,7 @@ export const register: Register = on => {
   // 4. DRAWING
   // ════════════════════════════════════════════════════════════════════════
 
-  // ── Band above the prompt: the "Savvy Progress" card ────────────────────
+  // ── Band above the prompt: the "Usage Radar" card ────────────────────
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const p = await read($, live)
     const m = main(p)
@@ -366,7 +435,7 @@ export const register: Register = on => {
       <Box flexDirection="column" borderStyle="round" borderColor={p.isRunning ? ORANGE : 'subtle'} paddingX={1}>
         <Box flexDirection="row" gap={3}>
           <Text color={ORANGE} bold>
-            ◉ Savvy Progress
+            ◉ Usage Radar
           </Text>
           <Text>
             <Text color={ORANGE}>✳ </Text>
@@ -400,11 +469,30 @@ export const register: Register = on => {
             {crew}
           </Text>
         </Text>
+        {meters(p).length > 0 && (
+          <Box flexDirection="row" gap={3}>
+            {meters(p).map(m => {
+              const g = bar(m.pct / 100, 10)
+              return (
+                <Text key={m.key}>
+                  <Text dimColor>{m.label} </Text>
+                  <Text color={levelColor(m.pct)}>{g.filled}</Text>
+                  <Text dimColor>{g.empty}</Text>
+                  <Text bold color={m.pct >= WARN ? levelColor(m.pct) : undefined}>
+                    {' '}
+                    {Math.round(m.pct)}%
+                  </Text>
+                  {m.pct >= WARN && <Text color={levelColor(m.pct)}> {m.pct >= DANGER ? '⛔' : '⚠'}</Text>}
+                </Text>
+              )
+            })}
+          </Box>
+        )}
       </Box>
     )
   })
 
-  // ── Side panel: "Agents" (open with /savvy) ─────────────────────────────
+  // ── Side panel: "Usage Radar" (open with /radar) ───────────────────────
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const p = await read($, live)
     const { Box, Text } = $.ui.resolve(e)
@@ -438,10 +526,36 @@ export const register: Register = on => {
             {p.agents.length} agent{p.agents.length === 1 ? '' : 's'}
             {working ? `  ·  ${working} running` : ''}
             {'  ·  '}
-            {p.steps} steps
+            {p.steps} step{p.steps === 1 ? '' : 's'}
           </Text>
         </Text>
 
+        {meters(p).length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Limits</Text>
+            {meters(p).map(m => {
+              const g = bar(m.pct / 100, barWidth)
+              const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, p.now)}` : ''
+              return (
+                <Box key={`limit-${m.key}`} flexDirection="column">
+                  <Box flexDirection="row" justifyContent="space-between">
+                    <Text>{m.label}</Text>
+                    <Text bold color={levelColor(m.pct)}>
+                      {Math.round(m.pct)}%{m.pct >= WARN ? (m.pct >= DANGER ? ' ⛔' : ' ⚠') : ''}
+                    </Text>
+                  </Box>
+                  <Text>
+                    <Text color={levelColor(m.pct)}>{g.filled}</Text>
+                    <Text dimColor>{g.empty}</Text>
+                    <Text dimColor>{fit(reset, 24)}</Text>
+                  </Text>
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+
+        {p.agents.length > 0 && <Text bold>Agents</Text>}
         {p.agents.length === 0 && <Text dimColor>No agents yet. Send a prompt.</Text>}
 
         {p.agents.map(a => {

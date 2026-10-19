@@ -1,0 +1,8 @@
+{
+  "name": "usage-radar",
+  "version": "2.0.0",
+  "description": "Live usage for Claude Code: plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, and an Agents panel (/radar).",
+  "types": "./types/index.d.ts",
+  "author": { "name": "Tejas Shah" },
+  "license": "MIT"
+}

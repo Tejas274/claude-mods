@@ -2,13 +2,13 @@
 
 **Free, open mods for [Claude Code](https://claude.com/claude-code).** Each one changes how Claude Code looks or works, and installs with one command.
 
-![Savvy Progress](savvy-progress/docs/agents-panel.png)
+![Usage Radar](usage-radar/docs/agents-panel.png)
 
 ## Mods
 
 | Mod | What it does | Install (inside Claude Code) |
 |---|---|---|
-| [**Savvy Progress**](./savvy-progress) | Live model, tokens, cost and timer above the prompt, a status line, and an Agents panel with per-agent cost (`/savvy`) | `/plugin install savvy-progress --marketplace Tejas274/claude-mods` |
+| [**Usage Radar**](./usage-radar) | Live plan limits (5-hour, weekly) and context with 80% / 95% alerts, plus cost, tokens, timer and a per-agent panel (`/radar`) | `/plugin install usage-radar --marketplace Tejas274/claude-mods` |
 | [**Turn Receipt** 🧾](./turn-receipt) | An itemized receipt for every job: per agent, per tool, slowest step, biggest read, files changed, cache hit. `/receipt` to view, `/receipt copy` to share | `/plugin install turn-receipt --marketplace Tejas274/claude-mods` |
 
 More coming soon.
@@ -21,7 +21,7 @@ More coming soon.
 
 ```bash
 claude plugin marketplace add Tejas274/claude-mods
-claude plugin install savvy-progress@claude-mods
+claude plugin install usage-radar@claude-mods
 ```
 
 **Update:** run `/plugin`, open **Marketplaces**, and update `claude-mods`.
@@ -54,7 +54,7 @@ Mods only see what Claude Code gives them. Each mod's README says exactly what i
 ```
 claude-mods/
 ├── .claude-plugin/marketplace.json   ← the list of mods
-├── savvy-progress/                   ← one folder per mod
+├── usage-radar/                      ← one folder per mod
 ├── template/                         ← starting point for a new mod
 ├── publish.sh                        ← validate + commit + push
 └── README.md

@@ -4,6 +4,7 @@
 old-steps/
 **/.claude-plugin/types/
 .mcpb-cache/
-# leftover from when savvy-progress was its own repo
-savvy-progress/.claude-plugin/marketplace.json
+# leftover from when this mod was its own repo
+usage-radar/.claude-plugin/marketplace.json
 *.tmp
+Claude outputs/

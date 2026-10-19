@@ -32,10 +32,18 @@ export type Live = {
   window: number
   agents: Agent[]
   todos: Todo[]
+  /** plan limits: five_hour, seven_day, or a gateway's spend_limit */
+  limits: Limit[]
+  /** main context fill, 0-100 */
+  contextPct: number | null
+  /** highest alert level already shown per meter (80 or 95), so each alert pops once */
+  alerted: Record<string, number>
 }
+
+export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'savvy-progress': { job: Live }
+    'usage-radar': { radar: Live }
   }
 }
