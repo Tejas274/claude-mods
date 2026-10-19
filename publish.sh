@@ -12,7 +12,7 @@ REPO="$USER_NAME/claude-mods"
 echo "GitHub account: $USER_NAME   →   https://github.com/$REPO"
 
 # put your username into the install lines
-grep -rl "YOUR_GITHUB_USERNAME" --include=*.md . | while read -r f; do
+for f in $(grep -rl "YOUR_GITHUB_USERNAME" --include=*.md . || true); do
   sed -i '' "s/YOUR_GITHUB_USERNAME/$USER_NAME/g" "$f"
 done
 

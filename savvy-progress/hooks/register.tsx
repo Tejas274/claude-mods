@@ -22,6 +22,9 @@ const EMPTY: Live = {
 const live = atom({ plugin: 'savvy-progress', key: 'job' } as const, EMPTY)
 
 const PANE = 'savvy-agents'
+// tiles (4) + summary (2) + 3 rows per agent + session total (2), and the dock width
+const paneRows = (agents: number): number => 8 + 3 * Math.max(1, agents)
+const PANE_COLUMNS = 64
 const TICK_MS = 250
 
 // Colours
@@ -200,7 +203,8 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'savvy' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Agents' })
+    const p = await read($, live)
+    await $.ui.open({ id: PANE, title: 'Agents', rows: paneRows(p.agents.length), columns: PANE_COLUMNS })
     return { text: 'Agents panel opened.' }
   })
 
@@ -239,7 +243,7 @@ export const register: Register = on => {
       const info = (await $.agent.list()).find(a => a.id === e.agentId)
       if (info) name = info.description || info.type
     }
-    await update($, live, p =>
+    const after = await update($, live, p =>
       withAgent({ ...p, isRunning: true }, id, a => ({
         ...a,
         name,
@@ -249,8 +253,10 @@ export const register: Register = on => {
       })),
     )
 
-    // a helper appeared → show the panel
-    if (e.agentId) void $.ui.open({ id: PANE, title: 'Agents' })
+    // a helper appeared → show the panel, tall enough for every agent
+    if (e.agentId) {
+      void $.ui.open({ id: PANE, title: 'Agents', rows: paneRows(after.agents.length), columns: PANE_COLUMNS })
+    }
 
     return next(e)
   })
