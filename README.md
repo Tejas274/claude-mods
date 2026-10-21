@@ -4,7 +4,7 @@ made these while figuring out how claude code mods work. two so far.
 
 ![usage-radar and turn-receipt in Claude Code](docs/hero.png)
 
-**usage-radar** sits above the prompt and shows what's happening while claude works: model, tokens, cost, time, context, and the 5h/weekly limits if your plan reports them (mine doesn't, so I only get context). warns you at 80% and 95%. `/radar` opens a panel with every agent and roughly what each one costs.
+**usage-radar** sits above the prompt and shows what's happening while claude works: model, tokens, cost and a live timer for the whole session, plus a `this request` line for just the prompt you're on. then context and the 5h/weekly limits if your plan reports them (mine doesn't, so I only get context). warns you at 80% and 95%. totals are saved per session, so `claude --resume` picks up where you left off. the session gets a name on its own: your `/rename`, a ticket ID from your first prompt, or its first few words. `/radar` opens a panel with every agent (`type · description`, kept for the whole session) and roughly what each one costs.
 
 **turn-receipt** prints a receipt when a job is done. agents, tools, slowest step, biggest read, files changed, cache hits, total cost. `/receipt` shows it, `/receipt copy` copies it as text.
 
