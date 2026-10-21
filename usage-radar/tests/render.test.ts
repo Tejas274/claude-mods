@@ -318,7 +318,7 @@ for (const ledgerAtLoad of [0, 1]) {
     const now = 400 * DAY
     const w = world(on, {
       'session:s1': {
-        v: 1, updatedAt: now - DAY, name: 'MRKRR-142', nameKind: 'ticket',
+        v: 1, updatedAt: now - DAY, name: 'DEMO-142', nameKind: 'ticket',
         cost: 1, tokens: 500_000, ms: 600_000, steps: 40, helperIds: ['old1', 'old2'],
       },
     }, now)
@@ -335,7 +335,7 @@ for (const ledgerAtLoad of [0, 1]) {
     await complete($, 'h', 'old1')
     await complete($, 'm')
 
-    const totals = [/^≈\$1\.20$/, /^511k$/, /^10:05$/, /41 steps/, /^MRKRR-142$/, /this request: ≈\$0\.20 · 11k · 0:05 · 1 step/]
+    const totals = [/^≈\$1\.20$/, /^511k$/, /^10:05$/, /41 steps/, /^DEMO-142$/, /this request: ≈\$0\.20 · 11k · 0:05 · 1 step/]
     await shows(pane($), ...totals, /Session total ≈\$1\.20/, /3 agents/)
     await shows(band($), ...totals)
   })
@@ -453,16 +453,16 @@ test('helper rows read type · description; teammates by name', async ($, on) =>
 })
 
 const NAMES: Array<[string, string, string]> = [
-  ['MRKRR-142 fix the login redirect', 'MRKRR-142', 'ticket'],
+  ['DEMO-142 fix the login redirect', 'DEMO-142', 'ticket'],
   ['USAGE-RADAR: Agent names', 'USAGE-RADAR', 'ticket'],
   ['please refactor the payment service retry logic', 'please refactor the payment service', 'words'],
   ['fix UTF-8 handling and TODO in src/ABC-1.ts', 'fix UTF-8 handling and TODO', 'words'],
-  ['fix mrkrr-142 redirect', 'MRKRR-142', 'ticket'],
+  ['fix qzx-142 redirect', 'QZX-142', 'ticket'],
   ['usage-radar tweaks', 'usage-radar tweaks', 'words'],
   ['bump gpt-4 and utf-8 support now', 'bump gpt-4 and utf-8 support', 'words'],
-  ['look at https://acme.atlassian.net/browse/MRKRR-142 please', 'MRKRR-142', 'ticket'],
+  ['look at https://acme.atlassian.net/browse/DEMO-142 please', 'DEMO-142', 'ticket'],
   ['see https://jira.example.com/jira/browse/ops-77?focusedCommentId=1', 'OPS-77', 'ticket'],
-  ['fix mrkrr-42 redirect', 'MRKRR-42', 'ticket'],
+  ['fix qzx-42 redirect', 'QZX-42', 'ticket'],
   ['do step-2 of the python-3 upgrade', 'do step-2 of the python-3', 'words'],
   ['show top-10 web-01 hosts in prod', 'show top-10 web-01 hosts in', 'words'],
   ['fix WEB-01 and CI-CD in prod', 'fix WEB-01 and CI-CD in', 'words'],
@@ -488,8 +488,8 @@ test('slash commands: built-ins give no name, your own do', async ($, on) => {
   const w = world(on)
   await prompt($, '/model sonnet', { name: 'model', args: 'sonnet' })
   expect(record(w)).toBeUndefined()
-  await prompt($, '/feature MRKRR-7 add search', { name: 'feature', args: 'MRKRR-7 add search' })
-  expect(record(w)).toMatchObject({ name: 'MRKRR-7', nameKind: 'ticket' })
+  await prompt($, '/feature DEMO-7 add search', { name: 'feature', args: 'DEMO-7 add search' })
+  expect(record(w)).toMatchObject({ name: 'DEMO-7', nameKind: 'ticket' })
 
   w.sid = 's2'
   await prompt($, '/feature add dark mode', { name: 'feature', args: 'add dark mode' })
@@ -1161,8 +1161,8 @@ test('/radar budget does not name the session', async ($, on) => {
   await prompt($, '/radar budget 5', { name: 'radar', args: 'budget 5' })
   await radarCmd($, 'budget 5')
   expect(record(w)).toMatchObject({ name: null, budget: 5 })
-  await job($, w, 'MRKRR-9 the real work', 0.01)
-  expect(record(w)?.name).toBe('MRKRR-9')
+  await job($, w, 'DEMO-9 the real work', 0.01)
+  expect(record(w)?.name).toBe('DEMO-9')
 })
 
 // ── The account badge ──────────────────────────────────────────────────

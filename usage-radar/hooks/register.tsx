@@ -254,8 +254,8 @@ const agentLabel = (info: { type?: string; description?: string; name?: string; 
   return `${type} · ${description}`
 }
 
-// Ticket IDs in a prompt, returned in capitals: "MRKRR-142" (no leading 0, so not "WEB-01"),
-// "mrkrr-42" when its letters aren't a plain word like step-2 or python-3, a capitals-only
+// Ticket IDs in a prompt, returned in capitals: "DEMO-142" (no leading 0, so not "WEB-01"),
+// "qzx-42" when its letters aren't a plain word like step-2 or python-3, a capitals-only
 // word ID like "USAGE-RADAR" (not "CI-CD"), or the ID in a Jira .../browse/ABC-1 link.
 // Never inside a word, a path or another URL; never "UTF-8", "GPT-4"...
 const JIRA_URL = /https?:\/\/\S*?\/browse\/([A-Za-z][A-Za-z0-9_]+-[1-9]\d*)(?![\w-])/g
