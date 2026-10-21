@@ -15,9 +15,36 @@ export type Agent = {
   context: number
   /** weighted usage this job, used to split the job's cost between agents */
   units: number
+  /** new tokens this session (input + cache writes + output) */
+  tokens: number
+  /** its cost from earlier jobs, and its whole cost frozen when it finished (null: no reading yet) */
+  priorCost: number
+  cost: number | null
+  /** working time of its earlier runs, in ms */
+  workedMs: number
+  /** the run it's on: when it started and ended */
   startedAt: number
   endedAt: number | null
+  /** when $.agent.list() last said it went idle (or waiting), and the paused time of this run */
+  pausedAt: number | null
+  pausedMs: number
+  /** it worked in this job (the job's toast and the band count these) */
+  thisJob: boolean
 }
+
+/** A finished helper as kept in the session record */
+export type SavedAgent = {
+  id: string
+  name: string
+  model: string
+  cost: number | null
+  tokens: number
+  ms: number
+  endedAt: number
+}
+
+/** Helpers that no longer have a row: how many, and what they cost and used */
+export type Earlier = { agents: number; cost: number; tokens: number }
 
 /** How the session got its name: /rename, a ticket ID in the first prompt, or its first words */
 export type NameKind = 'rename' | 'ticket' | 'words'
@@ -33,13 +60,16 @@ export type Saved = {
   ms: number
   steps: number
   helperIds: string[]
+  /** the session's helpers, and the ones folded away (2.1.0 records have neither: read as none) */
+  agents: SavedAgent[]
+  earlier: Earlier
 }
 
 /**
  * Everything the screen shows. A "job" = from your prompt until the main agent AND every
- * helper agent are done; job fields (steps, agents, costUsd/baseCost, jobTokens, startedAt)
- * start over each job. Session fields (sessionId, name, sessionCost, sessionTokens, priorMs,
- * sessionSteps, helperIds) add up over the whole session and are saved.
+ * helper agent are done; job fields (steps, costUsd/baseCost, jobTokens, startedAt) start
+ * over each job. Session fields (sessionId, name, sessionCost, sessionTokens, priorMs,
+ * sessionSteps, helperIds, agents, earlier) add up over the whole session and are saved.
  */
 export type Live = {
   isRunning: boolean
@@ -78,6 +108,8 @@ export type Live = {
   sessionSteps: number
   /** every helper agent seen this session, each counted once */
   helperIds: string[]
+  /** finished helpers past the rows we keep, folded into one line */
+  earlier: Earlier
 }
 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
