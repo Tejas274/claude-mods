@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, Timer } from 'claude-code'
+import type { EngineInterface, PromptSubmitInput, Register, Timer } from 'claude-code'
 
-import type { Agent, Limit, Live, Todo } from '../types'
+import type { Agent, Limit, Live, NameKind, Saved, Todo } from '../types'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 1. STATE: everything the screen shows lives in one value. Writing it redraws.
@@ -20,20 +20,35 @@ const EMPTY: Live = {
   limits: [],
   contextPct: null,
   alerted: {},
+  sessionId: null,
+  name: null,
+  nameKind: null,
+  sessionCost: 0,
+  lastLedger: null,
+  jobTokens: 0,
+  sessionTokens: 0,
+  priorMs: 0,
+  sessionSteps: 0,
+  helperIds: [],
 }
-const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY)
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v2' })
 
 const PANE = 'radar-agents'
-// tiles (4) + summary (2) + 3 rows per agent + session total (2), and the dock width
-const paneRows = (agents: number, limits: number): number => 10 + 2 * limits + 3 * Math.max(1, agents)
+// name (1) + tiles (4) + this request (1) + summary (2) + 3 rows per agent + session total (2), and the dock width
+const paneRows = (agents: number, limits: number): number => 12 + 2 * limits + 3 * Math.max(1, agents)
 const PANE_COLUMNS = 64
 const TICK_MS = 250
 
-// Colours
-const ORANGE = '#E8803A'
-const AMBER = '#F2B36B'
-const GREEN = '#7BC88F'
-const RED = '#E5616B'
+// Session totals are saved per session id in $.store, at most every 15 s while working
+const SAVE_MS = 15_000
+const PRUNE_MS = 90 * 24 * 60 * 60 * 1000 // sessions unused for 90 days are forgotten
+const KEY = (id: string): string => `session:${id}`
+
+// Colours: theme keys, not raw hex, so they stay readable on light and dark terminals
+const ORANGE = 'claude'
+const AMBER = 'warning'
+const GREEN = 'success'
+const RED = 'error'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 2. HELPERS: plain functions that only turn data into text (no `$` in here)
@@ -99,11 +114,143 @@ const agentCost = (p: Live, a: Agent): number | null => {
   return cost === null || total === 0 ? null : (cost * a.units) / total
 }
 
-const totalTokens = (p: Live): number => p.agents.reduce((sum, a) => sum + a.context, 0)
 const main = (p: Live): Agent | undefined => p.agents.find(a => a.id === 'main')
 const helpers = (p: Live): Agent[] => p.agents.filter(a => a.id !== 'main')
 const anyRunning = (p: Live): boolean => p.agents.some(a => a.isRunning)
-const elapsed = (p: Live): string => clock(p.now - p.startedAt)
+
+// New tokens of one request: input + cache writes + output. Cache reads are left out:
+// they re-read the same history on every step, so they would count it again and again.
+const freshTokens = (u: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number }): number =>
+  u.input_tokens + u.cache_creation_input_tokens + u.output_tokens
+
+// Working time: this job, and the whole session (earlier jobs + this one; idle gaps don't count)
+const jobMs = (p: Live): number => Math.max(0, p.now - p.startedAt)
+const elapsed = (p: Live): string => clock(jobMs(p))
+const sessionClock = (p: Live): string => clock(p.priorMs + jobMs(p))
+
+// What the whole session has cost ("—" until the engine reports a cost)
+const totalCost = (p: Live): number | null => (p.costUsd === null && p.sessionCost === 0 ? null : p.sessionCost)
+
+// Main (once it has done anything) + every helper seen this session
+const sessionAgents = (p: Live): number => (main(p) || p.sessionSteps || p.sessionTokens ? 1 : 0) + p.helperIds.length
+
+// 1 → "1 step", 3 → "3 steps"
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+
+// The dim line under the totals: just the current request
+const thisRequest = (p: Live): string =>
+  `this request: ${money(jobCost(p))} · ${k(p.jobTokens)} · ${elapsed(p)} · ${plural(p.steps, 'step')}`
+
+// A new reading of the engine's cost ledger: add what changed since the last one.
+// If the ledger went down (it started over), the whole new reading is new cost.
+const withLedger = (p: Live, ledger: number | null): Live => {
+  if (ledger === null) return p
+  const last = p.lastLedger ?? ledger
+  const delta = ledger >= last ? ledger - last : ledger
+  return { ...p, costUsd: ledger, lastLedger: ledger, sessionCost: p.sessionCost + delta }
+}
+
+// A helper's row name: "researcher · Find database config"; a teammate's own name
+const agentLabel = (info: { type?: string; description?: string; name?: string }): string => {
+  const type = info.type?.trim() ?? ''
+  const description = info.description?.trim() ?? ''
+  if (type === 'teammate') return info.name?.trim() || description || 'Helper'
+  if (!type) return description || 'Helper'
+  if (!description || description.toLowerCase() === type.toLowerCase()) return type
+  return `${type} · ${description}`
+}
+
+// Ticket IDs in a prompt. "MRKRR-142" (any case, returned in capitals), or a capitals-only
+// word ID like "USAGE-RADAR". Never inside a word, a path or a URL; never "UTF-8", "GPT-4"...
+const TICKET_NUMBER = /(?<![\w./-])[A-Za-z]{2,}-\d+(?![\w/-])/g
+const TICKET_WORDS = /(?<![\w./-])[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+(?![\w/-])/g
+const NOT_TICKET = /^(UTF|ISO|SHA|MD|HTTP|HTTPS|TLS|SSL|COVID|GPT|ES|IPV|RFC|AES|RSA|UTC|GMT|TODO|FIXME|WIP)-/i
+const NAME_MAX = 80
+
+const ticketOf = (text: string): string | null => {
+  const found = [...text.matchAll(TICKET_NUMBER), ...text.matchAll(TICKET_WORDS)]
+    .filter(m => !NOT_TICKET.test(m[0]))
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))[0]
+  return found ? found[0].toUpperCase() : null
+}
+
+// "please refactor the payment service retry logic" → "please refactor the payment service"
+const firstWords = (text: string, n: number): string | null => {
+  const words = text.replace(/\s+/g, ' ').trim().split(' ').slice(0, n).join(' ')
+  return words.replace(/[.,:;!?-]+$/, '') || null
+}
+
+// A session name from the first prompt: a ticket ID if it has one, else its first 5 words
+const autoName = (text: string): { name: string; kind: NameKind } | null => {
+  const ticket = ticketOf(text)
+  if (ticket) return { name: ticket.slice(0, NAME_MAX), kind: 'ticket' }
+  const words = firstWords(text, 5)
+  return words ? { name: words.slice(0, NAME_MAX), kind: 'words' } : null
+}
+
+// /rename always wins; an automatic name only fills an empty one
+const withName = (p: Live, name: string, kind: NameKind): Live =>
+  kind === 'rename' || !p.name ? { ...p, name: name.slice(0, NAME_MAX), nameKind: kind } : p
+
+// Count each helper once per session, by its id
+const withHelper = (p: Live, id: string): Live =>
+  id === 'main' || p.helperIds.includes(id) ? p : { ...p, helperIds: [...p.helperIds, id] }
+
+// What we keep in the store for this session
+const toSaved = (p: Live, now: number): Saved => ({
+  v: 1,
+  updatedAt: now,
+  name: p.name,
+  nameKind: p.nameKind,
+  cost: p.sessionCost,
+  tokens: p.sessionTokens,
+  ms: p.priorMs + jobMs(p),
+  steps: p.sessionSteps,
+  helperIds: p.helperIds,
+})
+
+// Read a stored record back; anything odd counts as missing
+const parseSaved = (raw: unknown): Saved | null => {
+  if (typeof raw !== 'object' || raw === null) return null
+  const r = raw as Record<string, unknown>
+  const count = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x) && x >= 0
+  const kinds: unknown[] = ['rename', 'ticket', 'words']
+  if (r.v !== 1) return null
+  if (![r.cost, r.tokens, r.ms, r.steps, r.updatedAt].every(count)) return null
+  if (r.name !== null && typeof r.name !== 'string') return null
+  if (r.nameKind !== null && !kinds.includes(r.nameKind)) return null
+  if (!Array.isArray(r.helperIds) || !r.helperIds.every(x => typeof x === 'string')) return null
+  return {
+    v: 1,
+    updatedAt: r.updatedAt as number,
+    name: r.name as string | null,
+    nameKind: r.nameKind as NameKind | null,
+    cost: r.cost as number,
+    tokens: r.tokens as number,
+    ms: r.ms as number,
+    steps: r.steps as number,
+    helperIds: r.helperIds as string[],
+  }
+}
+
+// Another session (start, --resume, /clear): start from its saved totals, or from zero.
+// The ledger now is the starting point, so nothing from before is counted twice.
+const freshSession = (p: Live, id: string, saved: Saved | null, ledger: number | null): Live => ({
+  ...EMPTY,
+  sessionId: id,
+  limits: p.limits,
+  alerted: p.alerted,
+  lastLedger: ledger,
+  ...(saved && {
+    name: saved.name,
+    nameKind: saved.nameKind,
+    sessionCost: saved.cost,
+    sessionTokens: saved.tokens,
+    priorMs: saved.ms,
+    sessionSteps: saved.steps,
+    helperIds: saved.helperIds,
+  }),
+})
 
 // Put one agent's change into the list (adds it if new)
 const withAgent = (p: Live, id: string, change: (a: Agent) => Agent): Live => {
@@ -120,15 +267,21 @@ const withAgent = (p: Live, id: string, change: (a: Agent) => Agent): Live => {
   }
   const next = change(base)
   const agents = known ? p.agents.map(a => (a.id === id ? next : a)) : [...p.agents, next]
-  // main first, then up to 8 helpers (newest kept)
-  return { ...p, agents: [...agents.filter(a => a.id === 'main'), ...agents.filter(a => a.id !== 'main').slice(-8)] }
+  // main first, then up to 8 helpers on screen (newest kept); every helper is still counted
+  return withHelper(
+    { ...p, agents: [...agents.filter(a => a.id === 'main'), ...agents.filter(a => a.id !== 'main').slice(-8)] },
+    id,
+  )
 }
 
-// A new job: keep main's model and context, forget last job's helpers and costs
+// A new job: keep main's model and context, forget last job's helpers and costs.
+// The last job's working time moves into the session's time; the other totals already count.
 const newJob = (p: Live, now: number, cost: number | null, window: number): Live => {
   const m = main(p)
   return {
     ...p,
+    priorMs: p.priorMs + jobMs(p),
+    jobTokens: 0,
     isRunning: true,
     startedAt: now,
     now,
@@ -245,20 +398,168 @@ const statusLine = (p: Live): string => {
   const icon = p.isRunning ? spinner(p.now) : '✓'
   const worst = [...meters(p)].sort((a, b) => b.pct - a.pct)[0]
   const gauge = worst ? ` · ${worst.label} ${Math.round(worst.pct)}%` : ''
-  return `${icon} ${model}${crew} · ${k(totalTokens(p))} · ${money(jobCost(p))}${gauge} · ${fit(activity(p), 28)} · ${elapsed(p)}`
+  return `${icon} ${model}${crew} · ${k(p.sessionTokens)} · ${money(totalCost(p))}${gauge} · ${fit(activity(p), 28)} · ${sessionClock(p)}`
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 3. HOOKS: listen to Claude Code's events
+// 3. SESSION: totals are saved per session id in $.store, so --resume continues them.
+//    Every `$` call here is wrapped: if saving breaks, the radar keeps going.
+// ════════════════════════════════════════════════════════════════════════════
+let savedAt = 0 // when we last saved, so saving while working stays occasional
+
+const save = async ($: EngineInterface): Promise<void> => {
+  try {
+    const p = await read($, live)
+    if (!p.sessionId) return
+    const now = await $.clock.now()
+    savedAt = now
+    await $.store.set(KEY(p.sessionId), toSaved(p, now))
+  } catch {
+    // not saved this time; the next save catches up
+  }
+}
+
+// save while working, but not on every step
+const saveSoon = async ($: EngineInterface): Promise<void> => {
+  try {
+    const now = await $.clock.now()
+    if (now - savedAt >= SAVE_MS || now < savedAt) await save($) // (a clock behind us: save, start over)
+  } catch {
+    // ignore
+  }
+}
+
+const load = async ($: EngineInterface, id: string): Promise<Saved | null> => {
+  try {
+    return parseSaved(await $.store.get(KEY(id)))
+  } catch {
+    return null
+  }
+}
+
+// Forget sessions not used for 90 days (and records we can't read). Other keys are left alone.
+const prune = async ($: EngineInterface, current: string): Promise<void> => {
+  try {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith('session:') || key === KEY(current)) continue
+      try {
+        const saved = parseSaved(await $.store.get(key))
+        if (!saved || now - saved.updatedAt > PRUNE_MS) await $.store.delete(key)
+      } catch {
+        // try again next time
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+// Which session are we in? On a new id (start, --resume, /clear) save the old one and
+// load the new one's totals, or start them at zero.
+const syncSession = async ($: EngineInterface): Promise<void> => {
+  try {
+    const id = await $.session.id()
+    if (!id) return
+    const p = await read($, live)
+    if (p.sessionId === id) return
+    if (p.sessionId) await save($)
+    const saved = await load($, id)
+    let ledger: number | null = null
+    try {
+      ledger = (await $.session.usage()).cost?.usd ?? null
+    } catch {
+      // no ledger reading: the first one later becomes the starting point
+    }
+    await update($, live, q => (q.sessionId === id ? q : freshSession(q, id, saved, ledger)))
+    await prune($, id)
+  } catch {
+    // no session id: keep counting as before
+  }
+}
+
+// A helper's row name, from the engine's list of agents
+const agentName = async ($: EngineInterface, agentId: string): Promise<string | undefined> => {
+  try {
+    const info = (await $.agent.list()).find(a => a.id === agentId)
+    return info ? agentLabel(info) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// A session name from a prompt you typed (not a notification, a schedule or a built-in command)
+const nameFrom = async ($: EngineInterface, e: PromptSubmitInput): Promise<{ name: string; kind: NameKind } | null> => {
+  if (e.isMeta) return null
+  if (e.origin && !['composer', 'bridge', 'sdk', 'coordinator'].includes(e.origin.kind)) return null
+  if (e.command) {
+    const name = e.command.name
+    try {
+      const info = (await $.command.list()).find(c => c.name === name)
+      return info?.source === 'builtin' ? null : autoName(e.command.args)
+    } catch {
+      return null
+    }
+  }
+  return autoName(e.text)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 4. HOOKS: listen to Claude Code's events
 // ════════════════════════════════════════════════════════════════════════════
 export const register: Register = on => {
   let ticker: Timer | undefined
 
-  // ── Startup: add the /radar command ─────────────────────────────────────
+  // ── Startup: pick up this session's totals, add the /radar command ─────
   on('session.start', async ($, e, next) => {
+    await syncSession($)
     await $.command.register({ name: 'radar', description: 'Open Usage Radar: limits, context, cost and agents' })
     return next(e)
   })
+
+  // ── The session ends (exit, /clear, ...): save its totals ───────────────
+  on('session.end', async ($, e, next) => {
+    await save($)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // ── Classic hooks carry the session's title. We treat session_title as the /rename
+  //    name; if it turns out to be filled in for sessions nobody renamed, drop this. ──
+  on('classic.SessionStart', async ($, e, next) => {
+    await syncSession($)
+    const title = e.session_title?.trim()
+    if (title) {
+      await update($, live, p => withName(p, title, 'rename'))
+      await save($)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    await syncSession($)
+    const title = e.session_title?.trim()
+    if (title) {
+      await update($, live, p => withName(p, title, 'rename'))
+      await save($)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // ── /rename: the built-in runs as usual, and the radar takes the new name ─
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    const r = await next(e)
+    try {
+      await syncSession($)
+      const title = e.args.trim()
+      if (title) {
+        await update($, live, p => withName(p, title, 'rename'))
+        await save($)
+      }
+    } catch {
+      // the rename itself already happened
+    }
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'radar' }, async $ => {
     const p = await read($, live)
@@ -268,6 +569,16 @@ export const register: Register = on => {
 
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
+    await syncSession($)
+    // the first prompt you type names the session (unless it has a name already)
+    if (!(await read($, live)).name) {
+      const n = await nameFrom($, e)
+      if (n) {
+        await update($, live, p => withName(p, n.name, n.kind))
+        await save($)
+      }
+    }
+
     if (e.command) return next(e) // slash commands like /radar don't start a new job
     const now = await $.clock.now()
     const usage = await $.session.usage()
@@ -276,9 +587,10 @@ export const register: Register = on => {
 
     let alerts: string[] = []
     const p = await update($, live, p => {
-      const base = anyRunning(p)
-        ? withAgent({ ...p, isRunning: true, costUsd: cost ?? p.costUsd }, 'main', a => ({ ...a, isRunning: true }))
-        : newJob(p, now, cost, window)
+      const q = withLedger(p, cost)
+      const base = anyRunning(q)
+        ? withAgent({ ...q, isRunning: true }, 'main', a => ({ ...a, isRunning: true }))
+        : newJob(q, now, cost, window)
       const r = withUsage(base, usage.rateLimits, usage.context.percent)
       alerts = r.alerts
       return r.next
@@ -302,11 +614,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const id = e.agentId ?? 'main'
     const now = await $.clock.now()
-    let name = id === 'main' ? 'Main' : 'Helper'
-    if (e.agentId) {
-      const info = (await $.agent.list()).find(a => a.id === e.agentId)
-      if (info) name = info.description || info.type
-    }
+    const name = (e.agentId && (await agentName($, e.agentId))) || (id === 'main' ? 'Main' : 'Helper')
     const after = await update($, live, p =>
       withAgent({ ...p, isRunning: true }, id, a => ({
         ...a,
@@ -331,14 +639,20 @@ export const register: Register = on => {
     const u = result.usage
     if (u) {
       const id = e.agentId ?? 'main'
+      // a helper we couldn't name at its start: ask again (it may be listed by now)
+      const known = (await read($, live)).agents.find(a => a.id === id)
+      const name = e.agentId && (!known || known.name === 'Helper') ? await agentName($, e.agentId) : undefined
       const usage = await $.session.usage()
+      const fresh = freshTokens(u)
       let alerts: string[] = []
       const p = await update($, live, p => {
+        const counted = withLedger({ ...p, window: usage.context.window || p.window }, usage.cost?.usd ?? null)
         const base = withAgent(
-          { ...p, costUsd: usage.cost?.usd ?? p.costUsd, window: usage.context.window || p.window },
+          { ...counted, jobTokens: counted.jobTokens + fresh, sessionTokens: counted.sessionTokens + fresh },
           id,
           a => ({
             ...a,
+            name: name ?? a.name,
             model: u.model,
             context: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens,
             units: a.units + unitsOf(u),
@@ -350,6 +664,7 @@ export const register: Register = on => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      await saveSoon($)
     }
     return result
   })
@@ -357,7 +672,12 @@ export const register: Register = on => {
   // ── Every tool call: show it, let it run, count it ──────────────────────
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as { tool: string } & Record<string, any>
-    const before = await update($, live, p => ({ ...p, steps: p.steps + 1, current: describe(input) }))
+    const before = await update($, live, p => ({
+      ...p,
+      steps: p.steps + 1,
+      sessionSteps: p.sessionSteps + 1,
+      current: describe(input),
+    }))
     $.ui.status(statusLine(before))
 
     const ran = await next(e) // ← the real tool runs here
@@ -379,7 +699,7 @@ export const register: Register = on => {
     const usage = await $.session.usage()
 
     const p = await update($, live, p => {
-      const after = withAgent({ ...p, now, costUsd: usage.cost?.usd ?? p.costUsd }, id, a => ({
+      const after = withAgent(withLedger({ ...p, now }, usage.cost?.usd ?? null), id, a => ({
         ...a,
         isRunning: false,
         endedAt: now,
@@ -392,6 +712,7 @@ export const register: Register = on => {
     if (!p.isRunning) {
       ticker?.cancel()
       ticker = undefined
+      await save($)
       if (p.steps > 0 || helpers(p).length > 0) {
         const crew = helpers(p).length ? ` · ${helpers(p).length + 1} agents` : ''
         $.ui.toast(
@@ -403,7 +724,7 @@ export const register: Register = on => {
   })
 
   // ════════════════════════════════════════════════════════════════════════
-  // 4. DRAWING
+  // 5. DRAWING
   // ════════════════════════════════════════════════════════════════════════
 
   // ── Band above the prompt: the "Usage Radar" card ────────────────────
@@ -428,8 +749,14 @@ export const register: Register = on => {
 
     const working = helpers(p).filter(a => a.isRunning).length
     const all = helpers(p).length
-    const plural = all === 1 ? 'helper' : 'helpers'
-    const crew = all ? `  ·  ${working ? `${working} of ${all} ${plural} working` : `${all} ${plural} done`}` : ''
+    const helperWord = all === 1 ? 'helper' : 'helpers'
+    const crew = all ? `  ·  ${working ? `${working} of ${all} ${helperWord} working` : `${all} ${helperWord} done`}` : ''
+
+    // the session's name (bold), then this request's own numbers (dim)
+    const name = p.name ? fit(p.name, Math.min(28, Math.floor(width / 3))) : null
+    const request = name
+      ? fit(`  ·  ${thisRequest(p)}`, Math.max(10, width - name.length))
+      : fit(thisRequest(p), width)
 
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={p.isRunning ? ORANGE : 'subtle'} paddingX={1}>
@@ -443,19 +770,23 @@ export const register: Register = on => {
           </Text>
           <Text>
             <Text dimColor># </Text>
-            <Text bold>{k(totalTokens(p))}</Text>
+            <Text bold>{k(p.sessionTokens)}</Text>
             <Text dimColor> tokens</Text>
           </Text>
           <Text>
             <Text color={AMBER} bold>
-              {money(jobCost(p))}
+              {money(totalCost(p))}
             </Text>
           </Text>
           <Text>
             <Text dimColor>⏱ </Text>
-            <Text bold>{elapsed(p)}</Text>
+            <Text bold>{sessionClock(p)}</Text>
           </Text>
         </Box>
+        <Text>
+          {name !== null && <Text bold>{name}</Text>}
+          <Text dimColor>{request}</Text>
+        </Text>
         <Text>
           <Text color={hasTodos && done === p.todos.length ? GREEN : ORANGE}>{b.filled}</Text>
           <Text dimColor>{b.empty}</Text>
@@ -464,10 +795,7 @@ export const register: Register = on => {
         <Text>
           <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
           <Text>{fit(activity(p), Math.max(10, width - 40))}</Text>
-          <Text dimColor>
-            {'  ·  '}step {p.steps}
-            {crew}
-          </Text>
+          <Text dimColor>{`  ·  ${plural(p.sessionSteps, 'step')}${crew}`}</Text>
         </Text>
         {meters(p).length > 0 && (
           <Box flexDirection="row" gap={3}>
@@ -512,21 +840,21 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" gap={1}>
-          {tile('cost', 'Cost', money(jobCost(p)), AMBER)}
-          {tile('tokens', 'Tokens', k(totalTokens(p)))}
-          {tile('time', 'Time', elapsed(p), p.isRunning ? ORANGE : undefined)}
+        <Box flexDirection="column">
+          {p.name ? <Text bold>{fit(p.name, width)}</Text> : null}
+          <Box flexDirection="row" gap={1}>
+            {tile('cost', 'Cost', money(totalCost(p)), AMBER)}
+            {tile('tokens', 'Tokens', k(p.sessionTokens))}
+            {tile('time', 'Time', sessionClock(p), p.isRunning ? ORANGE : undefined)}
+          </Box>
+          <Text dimColor>{fit(thisRequest(p), width)}</Text>
         </Box>
 
         <Text>
           <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
           <Text bold>{p.isRunning ? 'Working' : 'Done'}</Text>
           <Text dimColor>
-            {'  ·  '}
-            {p.agents.length} agent{p.agents.length === 1 ? '' : 's'}
-            {working ? `  ·  ${working} running` : ''}
-            {'  ·  '}
-            {p.steps} step{p.steps === 1 ? '' : 's'}
+            {`  ·  ${plural(sessionAgents(p), 'agent')}${working ? `  ·  ${working} running` : ''}  ·  ${plural(p.sessionSteps, 'step')}`}
           </Text>
         </Text>
 
@@ -585,11 +913,7 @@ export const register: Register = on => {
           )
         })}
 
-        {p.costUsd !== null && (
-          <Text dimColor>
-            Session total {money(p.costUsd)}
-          </Text>
-        )}
+        {totalCost(p) !== null && <Text dimColor>{`Session total ${money(totalCost(p))}`}</Text>}
       </Box>
     )
   })
