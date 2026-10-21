@@ -118,6 +118,11 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
     toasts: [] as string[],
     next: null as unknown,
     clock: mock.clock(on, { now }),
+    /** once: runs while the engine answers agent.list, or after session.usage has read the ledger */
+    onList: null as null | (() => Promise<void>),
+    onUsage: null as null | (() => Promise<void>),
+    /** the rows the pane asked for, each time it opened */
+    opened: [] as number[],
   }
   on('store.get', (_$: any, e: any) => ({ value: w.store.get(e.key) }) as never)
   on('store.set', (_$: any, e: any) => {
@@ -130,18 +135,27 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }) as never)
   on('session.id', () => ({ value: w.sid }) as never)
-  on('session.usage', () => ({ value: {
-    startedAt: 0,
-    context: { window: 200_000, percent: 10 },
-    rateLimits: [],
-    cost: { usd: w.cost },
-  } }) as never)
+  on('session.usage', async () => {
+    const value = { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: [], cost: { usd: w.cost } }
+    const f = w.onUsage
+    w.onUsage = null
+    if (f) await f()
+    return { value } as never
+  })
   on('command.list', () => ({ value: [
     { name: 'model', description: 'Set the model', source: 'builtin' },
     { name: 'feature', description: 'Build a feature', source: 'user' },
   ] }) as never)
-  on('agent.list', () => ({ value: w.agents }) as never)
-  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('agent.list', async () => {
+    const f = w.onList
+    w.onList = null
+    if (f) await f()
+    return { value: w.agents } as never
+  })
+  on('ui.open', (_$: any, e: any) => {
+    if (typeof e.rows === 'number') w.opened.push(e.rows)
+    return { value: { isPlaced: true } } as never
+  })
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', (_$: any, e: any) => { w.toasts.push(e.text); return { value: undefined } as never })
   on('command.register', () => ({ value: { command: 'radar' } }) as never)
@@ -375,7 +389,7 @@ test('each helper is counted once per session', async ($, on) => {
     await start($, `h${i}`, `a${i}`)
     await step($, w, `h${i}`, 1_000, 0, `a${i}`)
   }
-  // a1 fell off the 8 rows on screen; another step brings it back
+  // nine running helpers: eight rows, and a1 (the first) is still on screen after another step
   await step($, w, 'h1', 1_000, 0, 'a1')
   await shows(pane($), /10 agents/, /^Explore · task 1$/)
 
@@ -387,6 +401,17 @@ test('each helper is counted once per session', async ($, on) => {
   await start($, 'm')
   await complete($, 'h9', 'a9')
   await shows(pane($), /10 agents/)
+  // ... nor gives it a nameless row; the one folded away (a1, an equal end time) stays folded
+  await hidden(pane($), /^Helper$/, /^Explore · task 1$/)
+  await shows(pane($), /^Explore · task 9$/, /^\+1 earlier agent · /)
+  const toasts = w.toasts.length
+  await complete($, 'h1', 'a1')
+  await hidden(pane($), /^Helper$/, /^Explore · task 1$/)
+  // the job ends: no toast for a job with no steps and no helpers of its own; a1 stays folded
+  await complete($, 'm')
+  expect(w.toasts.length).toBe(toasts)
+  expect(record(w)?.agents.map((a: any) => a.id)).not.toContain('a1')
+  expect(record(w)?.earlier).toMatchObject({ agents: 1 })
 })
 
 test('helper rows read type · description; teammates by name', async ($, on) => {
@@ -397,14 +422,18 @@ test('helper rows read type · description; teammates by name', async ($, on) =>
     { id: 'a3', description: 'Draft spec', type: 'teammate', status: 'running' },
     { id: 'a4', description: 'planner', type: 'planner', status: 'running' },
     { id: 'a5', description: '', type: 'coder', status: 'running' },
+    { id: 'a7', description: 'Write tests', type: 'tester', teammateId: 'bob@crew', status: 'running' },
   ]
   await prompt($, 'team')
   await start($, 'm')
-  for (let i = 1; i <= 6; i++) await start($, `h${i}`, `a${i}`)
+  for (let i = 1; i <= 7; i++) await start($, `h${i}`, `a${i}`)
   // a6 is listed only after its start: its first step names it
   w.agents.push({ id: 'a6', description: 'Review the diff', type: 'reviewer', status: 'running' })
   await step($, w, 'h6', 1_000, 0, 'a6')
   await shows(pane($), /^Main$/, /^researcher · Find database/, /^alice$/, /^Draft spec$/, /^planner$/, /^coder$/, /^reviewer · Review the diff$/)
+  // a teammate with a type is still shown by the name in its teammateId
+  await shows(pane($), /^bob$/)
+  await hidden(pane($), /^tester · Write tests$/)
 })
 
 const NAMES: Array<[string, string, string]> = [
@@ -415,6 +444,14 @@ const NAMES: Array<[string, string, string]> = [
   ['fix mrkrr-142 redirect', 'MRKRR-142', 'ticket'],
   ['usage-radar tweaks', 'usage-radar tweaks', 'words'],
   ['bump gpt-4 and utf-8 support now', 'bump gpt-4 and utf-8 support', 'words'],
+  ['look at https://acme.atlassian.net/browse/MRKRR-142 please', 'MRKRR-142', 'ticket'],
+  ['see https://jira.example.com/jira/browse/ops-77?focusedCommentId=1', 'OPS-77', 'ticket'],
+  ['fix mrkrr-42 redirect', 'MRKRR-42', 'ticket'],
+  ['do step-2 of the python-3 upgrade', 'do step-2 of the python-3', 'words'],
+  ['show top-10 web-01 hosts in prod', 'show top-10 web-01 hosts in', 'words'],
+  ['fix WEB-01 and CI-CD in prod', 'fix WEB-01 and CI-CD in', 'words'],
+  ['open docs/browse/ABC-1.md and fix', 'open docs/browse/ABC-1.md and fix', 'words'],
+  ['upgrade ruby-3.2 and node-18.1 then vue-3.4', 'upgrade ruby-3.2 and node-18.1 then', 'words'],
 ]
 
 test('the first prompt names the session', async ($, on) => {
@@ -479,4 +516,346 @@ test('a long name is cut to fit a narrow band', async ($, on) => {
   expect(names[0]?.text.length ?? 99).toBeLessThanOrEqual(13)
   expect(names[0]?.text).toEndWith('…')
   await ui.unmount()
+})
+
+test('the main row shows session totals, without cache reads or helpers', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+
+  // job 1: main and a helper with equal usage → the helper's share is half of $0.20
+  await prompt($, 'first job')
+  await start($, 'm')
+  w.cost = 0.10
+  await step($, w, 'm', 10_000, 0)
+  await start($, 'h', 'a1')
+  w.cost = 0.20
+  await step($, w, 'h', 10_000, 0, 'a1')
+  await w.clock.advance(2_000)
+  await complete($, 'm')
+  await complete($, 'h', 'a1')
+
+  // job 2: main only; its cache reads don't count
+  await prompt($, 'second job')
+  await start($, 'm')
+  w.cost = 0.30
+  await step($, w, 'm', 5_000, 0, undefined, 100_000)
+  await w.clock.advance(3_000)
+  await complete($, 'm')
+
+  // cards: the session; main's row: the session minus the helper's $0.10 and 10k
+  await shows(pane($), /^≈\$0\.30$/, /^25k$/, /^≈\$0\.20$/, /15k · 0:05$/)
+  expect(record(w)?.agents).toMatchObject([{ id: 'a1', tokens: 10_000 }])
+  expect(Math.abs(record(w)?.agents[0].cost - 0.10)).toBeLessThan(1e-9)
+
+  // no helpers at all: main's row is exactly the cards (a new session's ledger starts at 0)
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'solo', 0.07, 4_000, 1_000)
+  const ui = await pane($)
+  expect((await ui.findAll({ type: 'Text', text: /^≈\$0\.07$/ })).length).toBe(2)
+  expect(await ui.find({ type: 'Text', text: /^ *5k · 0:00$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the clock keeps ticking while a background helper works', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await w.clock.advance(1_000)
+  await complete($, 'm')
+
+  // a minute later a background helper starts: the gap isn't counted, then time ticks
+  await w.clock.advance(60_000)
+  await start($, 'h', 'a1')
+  await w.clock.advance(2_000)
+  await shows(band($), /^0:03$/)
+  await shows(pane($), /^0:03$/, /1 running/, /0:02$/)
+  await w.clock.advance(2_000)
+  await shows(band($), /^0:05$/)
+  await shows(pane($), /^0:05$/, /0:04$/)
+})
+
+test('a helper the engine lists as finished stops the clock and the totals refresh', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h', 'a1')
+  w.cost = 0.10
+  await step($, w, 'h', 1_000, 0, 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+
+  // its turn.complete never comes; the next poll sees it finished and the new cost
+  w.agents[0]!.status = 'completed'
+  w.cost = 0.25
+  await w.clock.advance(1_000)
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+  const toasts = w.toasts.length
+  await shows(pane($), /^≈\$0\.25$/, /^0:03$/, /Done/)
+
+  await w.clock.advance(5_000)
+  await shows(band($), /^0:03$/)
+  // a late turn.complete: no second toast, the time stays
+  await complete($, 'h', 'a1')
+  expect(w.toasts.length).toBe(toasts)
+  await shows(band($), /^0:03$/)
+})
+
+test('an idle teammate pauses its clock, and the job clock when nobody else works', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: 'Write plan', type: 'teammate', name: 'alice', status: 'running' }]
+  await prompt($, 'team')
+  await start($, 'm')
+  await start($, 'h', 'a1')
+  await step($, w, 'h', 1_000, 0, 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+
+  // listed idle from the next poll on (at 0:03): nothing advances, but the job isn't done
+  w.agents[0]!.status = 'idle'
+  await w.clock.advance(1_000)
+  await w.clock.advance(5_000)
+  await shows(band($), /^0:03$/)
+  await shows(pane($), /^0:03$/, /0:03 · idle$/, /1 running/, /Working/)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+
+  // working again: both clocks go on from where they stopped
+  w.agents[0]!.status = 'running'
+  await w.clock.advance(1_000)
+  await w.clock.advance(2_000)
+  await shows(band($), /^0:05$/)
+  await shows(pane($), /^0:05$/, /1k · 0:05$/)
+  await hidden(pane($), /idle$/)
+})
+
+test('agents stay listed for the whole session, frozen once finished', async ($, on) => {
+  const w = world(on)
+  w.agents = [
+    { id: 'a1', description: '', type: 'coder', status: 'running' },
+    { id: 'a2', description: '', type: 'reviewer', status: 'running' },
+  ]
+  // job 1: coder costs half of $0.20, 10k tokens, 2 s
+  await prompt($, 'first job')
+  await start($, 'm')
+  w.cost = 0.10
+  await step($, w, 'm', 10_000, 0)
+  await start($, 'h1', 'a1')
+  w.cost = 0.20
+  await step($, w, 'h1', 10_000, 0, 'a1')
+  await w.clock.advance(2_000)
+  await complete($, 'h1', 'a1')
+  await complete($, 'm')
+
+  // job 2: a reviewer works while the cost goes up; the coder's row doesn't change
+  await prompt($, 'second job')
+  await start($, 'm')
+  await start($, 'h2', 'a2')
+  w.cost = 0.50
+  await step($, w, 'h2', 30_000, 0, 'a2')
+  await w.clock.advance(4_000)
+  const ui = await pane($)
+  expect(await ui.find({ type: 'Text', text: /^≈\$0\.10$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /10k · 0:02$/ })).toBeDefined()
+  // the running reviewer comes before the finished, dimmed coder
+  const names = await ui.findAll({ type: 'Text', text: /^(reviewer|coder)$/ })
+  expect(names.map(n => n.text)).toEqual(['reviewer', 'coder'])
+  expect(names[1]?.props.dimColor).toBe(true)
+  expect(names[0]?.props.dimColor).toBeFalsy()
+  await ui.unmount()
+  await shows(pane($), /3 agents/, /1 running/)
+})
+
+test('helpers past the 8 rows share one "+N earlier agents" line', async ($, on) => {
+  const w = world(on)
+  w.agents = Array.from({ length: 10 }, (_, i) => ({ id: `a${i + 1}`, description: '', type: `t${i + 1}`, status: 'running' }))
+  await prompt($, 'many')
+  await start($, 'm')
+  for (let i = 1; i <= 10; i++) await start($, `h${i}`, `a${i}`)
+  w.cost = 1
+  for (let i = 1; i <= 10; i++) await step($, w, `h${i}`, 1_000, 0, `a${i}`)
+  // ten running: the two past the rows are on the line as running, not as earlier
+  await shows(pane($), /^\+2 more running · ≈\$0\.20$/)
+  await hidden(pane($), /earlier agent/)
+  // they finish in turn, each with a tenth of $1
+  for (let i = 1; i <= 10; i++) {
+    await w.clock.advance(100)
+    await complete($, `h${i}`, `a${i}`)
+  }
+  await complete($, 'm')
+  // the 8 latest have rows; t1 and t2 share a line
+  await shows(pane($), /^t10$/, /^t3$/, /^\+2 earlier agents · ≈\$0\.20$/)
+  await hidden(pane($), /^t1$/, /^t2$/)
+
+  // the next job folds them away for good; the line and the totals stay
+  await job($, w, 'next', 1.10)
+  await shows(pane($), /^\+2 earlier agents · ≈\$0\.20$/, /^t10$/, /^≈\$1\.10$/)
+  expect(record(w)?.agents.length).toBe(8)
+  expect(record(w)?.earlier).toMatchObject({ agents: 2, tokens: 2_000 })
+})
+
+test('resume brings the session\'s agents back; another session has none', async ($, on) => {
+  const now = 400 * DAY
+  const agent = { id: 'x1', name: 'researcher · Find config', model: 'claude-opus-5-5', cost: 0.42, tokens: 12_000, ms: 65_000, endedAt: now - DAY }
+  const w = world(on, {
+    'session:s1': {
+      v: 1, updatedAt: now - DAY, name: 'old work', nameKind: 'words',
+      cost: 1, tokens: 50_000, ms: 600_000, steps: 4, helperIds: ['x1'],
+      // a bad entry is dropped, the rest of the record still loads
+      agents: [agent, { id: 3 }, 'junk', { ...agent, id: 'x2', tokens: -1 }],
+    },
+  }, now)
+  await job($, w, 'more', 0.05)
+  await shows(pane($), /^researcher · Find config$/, /^≈\$0\.42$/, /12k · 1:05$/, /^≈\$1\.05$/, /2 agents/)
+  await hidden(pane($), /earlier agent/)
+  expect(record(w)?.agents).toMatchObject([{ id: 'x1', cost: 0.42, tokens: 12_000, ms: 65_000 }])
+
+  // /clear: a new session starts with no agents (and its ledger at 0)
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'fresh', 0.01)
+  await hidden(pane($), /researcher/)
+  expect(record(w)?.agents).toEqual([])
+})
+
+test('a 2.1.0 record without agents still loads', async ($, on) => {
+  const now = 400 * DAY
+  const w = world(on, {
+    'session:s1': {
+      v: 1, updatedAt: now - DAY, name: 'old', nameKind: 'words',
+      cost: 0.5, tokens: 1_000, ms: 1_000, steps: 1, helperIds: [],
+    },
+  }, now)
+  await job($, w, 'more', 0.01)
+  await shows(pane($), /^old$/, /^≈\$0\.51$/)
+  expect(record(w)).toMatchObject({ agents: [], earlier: { agents: 0, cost: 0, tokens: 0 } })
+})
+
+test('a poll and a turn.complete ending the job together give one "All done"', async ($, on) => {
+  const w = world(on)
+  // once armed: just before the poll's write lands, the helper's turn.complete writes first,
+  // so the poll's write misses and update runs the poll's change again
+  let race = false
+  on('state.set', async (_$: any, e: any, next: any) => {
+    if (race && e.value?.value?.isRunning === false && e.value?.value?.agents?.some((a: any) => a.id === 'a1')) {
+      race = false
+      await complete($, 'h', 'a1')
+    }
+    return next(e)
+  })
+  w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h', 'a1')
+  await step($, w, 'h', 1_000, 0, 'a1')
+  await complete($, 'm')
+  await w.clock.advance(500)
+
+  // the poll sees it finished
+  race = true
+  w.agents[0]!.status = 'completed'
+  await w.clock.advance(1_000)
+  await w.clock.advance(2_000)
+  expect(race).toBe(false)
+  expect(w.toasts.filter(t => t.includes('All done')).length).toBe(1)
+})
+
+test('a late tick of an old clock does not stop the clock of a new background turn', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+  // stage 1: while a tick writes, main's turn ends (stopping that clock), so the tick tries again;
+  // stage 2: right after its retry lands, a background helper starts a new clock
+  let stage = 0
+  on('state.set', async (_$: any, e: any, next: any) => {
+    if (stage === 1) {
+      stage = 0
+      await complete($, 'm')
+      stage = 2
+      return next(e)
+    }
+    if (stage === 2 && e.value?.value?.isRunning === false) {
+      stage = 0
+      const r = await next(e)
+      await start($, 'h', 'a1')
+      return r
+    }
+    return next(e)
+  })
+  await prompt($, 'go')
+  await start($, 'm')
+  stage = 1
+  await w.clock.advance(250)
+  expect(stage).toBe(0)
+  await w.clock.advance(3_000)
+  await shows(pane($), /1 running/)
+  await shows(band($), /^0:03$/)
+})
+
+test('a ledger reading that arrives late is not counted again', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.10
+  await step($, w, 'm', 1_000, 0)
+
+  // while the poll waits for the agent list, main's next step moves the ledger to $0.20
+  w.onList = async () => {
+    w.cost = 0.20
+    await step($, w, 'm', 1_000, 0)
+  }
+  await w.clock.advance(1_000)
+  expect(w.onList).toBeNull()
+  await shows(pane($), /^≈\$0\.20$/, /Session total ≈\$0\.20/, /this request: ≈\$0\.20/)
+
+  // the poll's own reading is $0.20 but a step to $0.30 lands first: the late $0.20 is left out
+  w.onUsage = async () => {
+    w.cost = 0.30
+    await step($, w, 'm', 1_000, 0)
+  }
+  await w.clock.advance(1_000)
+  expect(w.onUsage).toBeNull()
+  await shows(pane($), /^≈\$0\.30$/, /Session total ≈\$0\.30/, /this request: ≈\$0\.30/)
+  await w.clock.advance(1_000)
+  await complete($, 'm')
+  await shows(pane($), /^≈\$0\.30$/)
+  expect(Math.abs(record(w)?.cost - 0.30)).toBeLessThan(1e-9)
+})
+
+// How many rows a drawn tree takes: Text 1, a column its children + gaps, a row its tallest, + borders
+const height = (el: any): number => {
+  if (!el || typeof el !== 'object') return 0
+  if (el.type === 'Text') return 1
+  const kids = (el.children ?? []).filter((c: any) => c && typeof c === 'object')
+  const inner = el.props?.flexDirection === 'row'
+    ? Math.max(0, ...kids.map(height))
+    : kids.reduce((s: number, c: any) => s + height(c), 0) + (el.props?.gap ?? 0) * Math.max(0, kids.length - 1)
+  return inner + (el.props?.borderStyle ? 2 : 0)
+}
+const radar = ($: Engine) =>
+  $.command.run({ command: 'radar', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as never)
+const fits = async ($: Engine, w: World) => {
+  await radar($)
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+}
+
+test('the panel opens exactly as tall as what it draws', async ($, on) => {
+  const w = world(on)
+  w.agents = Array.from({ length: 10 }, (_, i) => ({ id: `a${i + 1}`, description: '', type: `t${i + 1}`, status: 'running' }))
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.10
+  await step($, w, 'm', 1_000, 0)
+  // the context meter is shown (1 limit row block); one helper
+  await start($, 'h1', 'a1')
+  await fits($, w)
+  // ten helpers: 8 rows and the "+2 more running" line
+  for (let i = 2; i <= 10; i++) await start($, `h${i}`, `a${i}`)
+  await fits($, w)
+  for (let i = 1; i <= 10; i++) await complete($, `h${i}`, `a${i}`)
+  await complete($, 'm')
+  await fits($, w)
 })
