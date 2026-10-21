@@ -37,6 +37,10 @@ the session name is your `/rename` name if you gave one. otherwise it's a ticket
 
 it also opens on its own when claude starts helper agents. on a wide terminal it docks on the right.
 
+while a helper runs, its row is bold with a spinner and the finished ones are dimmed:
+
+![the /radar panel with a helper running](docs/images/panel-running.png)
+
 #### session budget
 
 ![a cost budget](docs/images/budget.png)
@@ -46,6 +50,8 @@ you can give a session a cost budget: `/radar budget 5` (or `$2.50`). the cost t
 the budget is saved with the session so it survives `--resume`, and `/clear` keeps the budget but starts the spend over. want one on every session? set `defaultBudget` (see options).
 
 #### burn-rate forecast
+
+![a burn-rate forecast on the weekly limit](docs/images/forecast.png)
 
 once a limit has been climbing for a few minutes of work, its meter also guesses when you'll hit it at the current pace, like `5h limit ━━━━━━━━━━ 46% · ~1h 10m left` (the panel says `~1h 10m left at this pace`). it only shows while claude is working, and not when the limit resets before you'd hit it anyway. you get a toast when it's under 30 minutes away, and another under 10.
 
