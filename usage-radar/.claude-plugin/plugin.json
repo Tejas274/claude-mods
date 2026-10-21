@@ -1,8 +1,35 @@
 {
   "name": "usage-radar",
-  "version": "2.1.1",
-  "description": "Live usage for Claude Code: plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, and an Agents panel (/radar).",
+  "version": "2.2.0",
+  "description": "Live usage for Claude Code: plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, an Agents panel (/radar), a burn-rate forecast for limits, a session budget (/radar budget) and an account badge.",
   "types": "./types/index.d.ts",
   "author": { "name": "Tejas Shah" },
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "accounts": {
+      "type": "string",
+      "multiple": true,
+      "title": "Account labels",
+      "description": "Label your accounts by email domain, one per entry as domain=LABEL (like example.com=WORK). Subdomains match too. Empty: just the email."
+    },
+    "showAccount": {
+      "type": "boolean",
+      "title": "Show account",
+      "description": "Show the signed-in account in the band and the panel.",
+      "default": true
+    },
+    "hideEmail": {
+      "type": "boolean",
+      "title": "Hide email",
+      "description": "Show only the account's label (or organization), not the email address.",
+      "default": false
+    },
+    "defaultBudget": {
+      "type": "number",
+      "title": "Default session budget (USD)",
+      "description": "Cost budget every new session starts with; 0 = none. Change it per session with /radar budget.",
+      "default": 0,
+      "min": 0
+    }
+  }
 }

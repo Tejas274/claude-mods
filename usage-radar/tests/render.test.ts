@@ -109,7 +109,7 @@ type Ui = {
 
 const DAY = 24 * 60 * 60 * 1000
 
-const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
+const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record<string, string> = {}) => {
   const w = {
     store: new Map<string, unknown>(Object.entries(seed)),
     sid: 's1',
@@ -123,7 +123,21 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
     onUsage: null as null | (() => Promise<void>),
     /** the rows the pane asked for, each time it opened */
     opened: [] as number[],
+    /** the plan limits session.usage reports (none, as off a subscription, unless a test sets them) */
+    limits: [] as Array<Record<string, unknown>>,
+    /** files $.fs.read finds (by path), and how many reads were asked for */
+    files: {} as Record<string, string>,
+    reads: 0,
+    /** the panes open now (by id) */
+    panes: new Set<string>(),
   }
+  mock.env(on, env)
+  on('fs.read', (_$: any, e: any) => {
+    w.reads++
+    const text = w.files[e.path]
+    return (text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }) as never
+  })
+  on('session.measure', (_$: any, e: any) => ({ changed: e.changed }) as never)
   on('store.get', (_$: any, e: any) => ({ value: w.store.get(e.key) }) as never)
   on('store.set', (_$: any, e: any) => {
     w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -136,7 +150,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
   on('store.keys', () => ({ value: [...w.store.keys()] }) as never)
   on('session.id', () => ({ value: w.sid }) as never)
   on('session.usage', async () => {
-    const value = { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: [], cost: { usd: w.cost } }
+    const value = { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: w.limits, cost: { usd: w.cost } }
     const f = w.onUsage
     w.onUsage = null
     if (f) await f()
@@ -154,8 +168,10 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0) => {
   })
   on('ui.open', (_$: any, e: any) => {
     if (typeof e.rows === 'number') w.opened.push(e.rows)
+    w.panes.add(e.id)
     return { value: { isPlaced: true } } as never
   })
+  on('ui.panes', () => ({ value: [...w.panes].map(id => ({ id, title: 'Usage Radar', isShown: true, isFocused: false, isPlaced: true })) }) as never)
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', (_$: any, e: any) => { w.toasts.push(e.text); return { value: undefined } as never })
   on('command.register', () => ({ value: { command: 'radar' } }) as never)
@@ -858,4 +874,467 @@ test('the panel opens exactly as tall as what it draws', async ($, on) => {
   for (let i = 1; i <= 10; i++) await complete($, `h${i}`, `a${i}`)
   await complete($, 'm')
   await fits($, w)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.2.0: the limit forecast, the session budget and the account badge
+// ════════════════════════════════════════════════════════════════════════════
+const radarCmd = ($: Engine, args: string) =>
+  $.command.run({ command: 'radar', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as never) as Promise<{ text?: string }>
+
+// The 5-hour limit as the engine reports it: used %, and its reset `resetInMs` after `now`
+const five = (pct: number, resetInMs = 3 * 3600_000, now = 0) =>
+  ({ kind: 'five_hour', percentUsed: pct, resetsAt: new Date(now + resetInMs).toISOString() })
+
+// The colour of the first Text matching `re` that has one; the band's border colour
+const color = async (mount: Promise<Ui>, re: RegExp) => {
+  const ui = await mount
+  const found = (await ui.findAll({ type: 'Text', text: re })).find(t => t.props.color !== undefined)
+  await ui.unmount()
+  return found?.props.color
+}
+const border = async (mount: Promise<Ui>) => {
+  const ui = await mount
+  const box = await ui.find({ type: 'Box' })
+  await ui.unmount()
+  return box?.props.borderColor
+}
+
+// Work for `seconds` (in 30 s steps), the 5-hour limit rising `by` points every 30 s
+const climb = async (w: World, from: number, by: number, seconds: number, reading = (pct: number) => five(pct)) => {
+  let pct = from
+  for (let s = 0; s < seconds; s += 30) {
+    await w.clock.advance(30_000)
+    pct += by
+    w.limits = [reading(pct)]
+  }
+  return pct
+}
+const paceToasts = (w: World, re = /at this pace/) => w.toasts.filter(t => re.test(t))
+
+test('the forecast shows after 3 minutes of steady work, with one ⚠', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  // a minute in: not measured long enough yet
+  await climb(w, 40, 1, 60)
+  await hidden(band($), /left/)
+  await climb(w, 42, 1, 120)
+  await w.clock.advance(10_000)
+  await shows(band($), /^ · ~2\dm left$/)
+  await shows(pane($), /~2\dm left at this pace/)
+  expect(paceToasts(w).length).toBe(1)
+  expect(paceToasts(w)[0]).toMatch(/^⚠ 5h limit: ~2\dm left at this pace · resets in /)
+  // more of the same pace: no second toast
+  await climb(w, 46, 1, 60)
+  expect(paceToasts(w).length).toBe(1)
+})
+
+test('a steep climb gives one ⛔, and no repeats', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await climb(w, 40, 5, 180)
+  await w.clock.advance(10_000)
+  expect(paceToasts(w).length).toBe(1)
+  expect(paceToasts(w)[0]).toMatch(/^⛔ 5h limit: ~\dm left at this pace/)
+  await climb(w, 70, 5, 60)
+  expect(paceToasts(w).length).toBe(1)
+})
+
+test('no forecast when the limit resets before it would run out', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  const soon = (pct: number) => five(pct, 20 * 60_000)
+  w.limits = [soon(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await climb(w, 40, 1, 180, soon)
+  await w.clock.advance(10_000)
+  await hidden(band($), /left/)
+  await hidden(pane($), /at this pace/)
+  expect(paceToasts(w).length).toBe(0)
+})
+
+test('the forecast goes when the job ends, and after a reset', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await climb(w, 40, 1, 180)
+  await w.clock.advance(10_000)
+  await shows(band($), /~2\dm left/)
+  await complete($, 'm')
+  await hidden(band($), /left/)
+  await hidden(pane($), /at this pace/)
+
+  // the next job picks the pace back up; then the window resets (40 → 1): measuring starts over
+  await prompt($, 'more')
+  await start($, 'm')
+  await w.clock.advance(2_000)
+  await shows(band($), /~\d+m left/)
+  w.limits = [five(1)]
+  await w.clock.advance(2_000)
+  await hidden(band($), /left/)
+})
+
+test('what a limit rose while idle is left out of the pace', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'first')
+  await start($, 'm')
+  const pct = await climb(w, 40, 1, 90)
+  await complete($, 'm')
+  // half an hour away while another window (another session) used 10 points
+  w.limits = [five(pct + 10)]
+  await w.clock.advance(30 * 60_000)
+  await prompt($, 'second')
+  await start($, 'm')
+  await climb(w, pct + 10, 1, 90)
+  await w.clock.advance(5_000)
+  // 6 points in ~3 minutes of work: ~23m left (with the idle 10 it would be ~8m)
+  await shows(band($), /^ · ~2\dm left$/)
+})
+
+// The live shape: no limits until the first response, ISO text or epoch seconds for the reset
+const NOW = Date.parse('2026-10-21T10:00:00Z')
+const LIVE_SHAPES: Array<[string, (pct: number) => Record<string, unknown>]> = [
+  ['ISO reset', pct => five(pct, 3 * 3600_000, NOW)],
+  ['epoch-seconds reset', pct => ({ kind: 'five_hour', percentUsed: pct, resetsAt: Math.floor((NOW + 3 * 3600_000) / 1000) })],
+]
+for (const [label, reading] of LIVE_SHAPES) {
+  test(`limits that appear only after the first response still get a forecast (${label})`, { timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on, {}, NOW)
+    // before the first response: no limits at all (as the engine reports them)
+    await prompt($, 'go')
+    await start($, 'm')
+    await w.clock.advance(5_000)
+    await hidden(band($), /5h limit/)
+    // the first response reports them, with the weekly one beside (no reset time)
+    w.limits = [reading(1), { kind: 'seven_day', percentUsed: 11 }]
+    await step($, w, 'm', 1_000, 0)
+    await shows(band($), /^5h limit $/, /^Weekly $/)
+    await shows(pane($), /resets in 3h 0m/)
+    let pct = 1
+    for (let s = 0; s < 240; s += 30) {
+      await w.clock.advance(30_000)
+      pct += 2
+      w.limits = [reading(pct), { kind: 'seven_day', percentUsed: 11 }]
+      await step($, w, 'm', 1_000, 0)
+    }
+    await w.clock.advance(10_000)
+    // ~4% a minute of work with 83% left: ~20m
+    await shows(band($), /^ · ~(19|2\d)m left$/)
+    await shows(pane($), /~(19|2\d)m left at this pace/)
+    expect(paceToasts(w).length).toBe(1)
+  })
+}
+
+test('limits the engine pushes (session.measure) reach the meters', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  await hidden(band($), /5h limit/)
+  await $.session.measure({
+    context: { window: 200_000, percent: 12 },
+    rateLimits: [five(84)],
+    changed: ['rateLimits'],
+  } as never)
+  await shows(band($), /^5h limit $/, /84%/)
+  expect(w.toasts.filter(t => /^⚠ 5h limit 84% used/.test(t)).length).toBe(1)
+})
+
+// ── The budget ─────────────────────────────────────────────────────────
+test('the budget warns at 80% and 100% once each, and colours the band', async ($, on) => {
+  const w = world(on)
+  expect((await radarCmd($, 'budget 1')).text).toBe('Budget set: $1.00 for this session · — spent so far')
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.50
+  await step($, w, 'm', 1_000, 0)
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual([])
+  expect(await color(band($), exactly('≈$0.50 / $1.00'))).toBe('success')
+  w.cost = 0.85
+  await step($, w, 'm', 1_000, 0)
+  w.cost = 0.90
+  await step($, w, 'm', 1_000, 0)
+  expect(await color(band($), exactly('≈$0.90 / $1.00'))).toBe('warning')
+  expect(await border(band($))).toBe('warning')
+  w.cost = 1.20
+  await step($, w, 'm', 1_000, 0)
+  await complete($, 'm')
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual(['⚠ Budget 80% used · ≈$0.85 / $1.00', '⛔ Budget reached · ≈$1.20 / $1.00'])
+  await shows(band($), exactly('≈$1.20 / $1.00'))
+  expect(await color(band($), exactly('≈$1.20 / $1.00'))).toBe('error')
+  expect(await border(band($))).toBe('error')
+  expect(await color(pane($), exactly('≈$1.20 / $1.00'))).toBe('error')
+  expect(record(w)).toMatchObject({ budget: 1, budgetFired: 100 })
+})
+
+test('resume keeps the budget and the warnings already shown', async ($, on) => {
+  const now = 400 * DAY
+  const w = world(on, {
+    'session:s1': {
+      v: 1, updatedAt: now - DAY, name: 'old', nameKind: 'words',
+      cost: 0.85, tokens: 1_000, ms: 1_000, steps: 1, helperIds: [], budget: 1, budgetFired: 80,
+    },
+  }, now)
+  await job($, w, 'more', 0.10)
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual([])
+  await shows(band($), exactly('≈$0.95 / $1.00'))
+  await job($, w, 'more', 0.20)
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual(['⛔ Budget reached · ≈$1.05 / $1.00'])
+  expect(record(w)).toMatchObject({ budget: 1, budgetFired: 100 })
+})
+
+test('/clear keeps the budget, its spend and warnings start over; resume keeps its own', async ($, on) => {
+  const w = world(on)
+  await radarCmd($, 'budget 1')
+  await job($, w, 'go', 0.90)
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual(['⚠ Budget 80% used · ≈$0.90 / $1.00'])
+
+  // /clear: a new id with no record
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'fresh', 0.10)
+  await shows(band($), exactly('≈$0.10 / $1.00'))
+  await job($, w, 'fresh', 0.85)
+  expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
+  expect(record(w, 's2')).toMatchObject({ budget: 1, budgetFired: 80 })
+
+  // back to s1: its own record
+  w.sid = 's1'
+  w.cost = 0
+  await job($, w, 'back', 0)
+  await shows(band($), exactly('≈$0.90 / $1.00'))
+  expect(record(w, 's1')).toMatchObject({ budget: 1, budgetFired: 80 })
+  expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
+})
+
+test('/radar budget: show, bad amounts, lowering below the spend, off, $2', async ($, on) => {
+  const w = world(on)
+  expect((await radarCmd($, 'budget abc')).text).toBe('Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50), or off.')
+  expect((await radarCmd($, 'budget -3')).text).toMatch(/takes an amount/)
+  expect((await radarCmd($, 'budget')).text).toBe('No budget for this session. Set one with /radar budget 5')
+  await job($, w, 'go', 0.50)
+  const toasts = w.toasts.length
+
+  // lowering it below what's spent: no toast now, the reply says so
+  expect((await radarCmd($, 'budget 0.40')).text).toBe('Budget set: $0.40 for this session · ≈$0.50 spent so far · already past 100%')
+  expect(w.toasts.length).toBe(toasts)
+  expect((await radarCmd($, 'budget')).text).toBe('Budget: ≈$0.50 / $0.40 (125%)')
+  await job($, w, 'more', 0.60)
+  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual([])
+
+  expect((await radarCmd($, 'budget off')).text).toBe('Budget off for this session.')
+  expect(record(w)).toMatchObject({ budget: null, budgetFired: 0 })
+  await shows(band($), exactly('≈$0.60'))
+  await hidden(band($), / \/ \$/)
+
+  expect((await radarCmd($, 'BUDGET $2')).text).toBe('Budget set: $2.00 for this session · ≈$0.60 spent so far')
+  await shows(pane($), exactly('≈$0.60 / $2.00'))
+})
+
+test('a default budget from the options; a record\'s own budget wins', { options: { defaultBudget: 5 } }, async ($, on) => {
+  const now = 400 * DAY
+  const old = { v: 1, updatedAt: now - DAY, name: 'old', nameKind: 'words', cost: 0.5, tokens: 1, ms: 1, steps: 1, helperIds: [] }
+  const w = world(on, { 'session:off': { ...old, budget: null }, 'session:none': old }, now)
+  await job($, w, 'go', 0.10)
+  await shows(band($), exactly('≈$0.10 / $5.00'))
+  // the default isn't saved: it comes back on its own
+  expect(record(w)?.budget).toBeUndefined()
+
+  w.sid = 'off'
+  w.cost = 0
+  await job($, w, 'go', 0.10)
+  await shows(band($), exactly('≈$0.60'))
+  await hidden(band($), / \/ \$/)
+
+  w.sid = 'none'
+  w.cost = 0
+  await job($, w, 'go', 0.10)
+  await shows(band($), exactly('≈$0.60 / $5.00'))
+})
+
+test('/radar budget does not name the session', async ($, on) => {
+  const w = world(on)
+  await prompt($, '/radar budget 5', { name: 'radar', args: 'budget 5' })
+  await radarCmd($, 'budget 5')
+  expect(record(w)).toMatchObject({ name: null, budget: 5 })
+  await job($, w, 'MRKRR-9 the real work', 0.01)
+  expect(record(w)?.name).toBe('MRKRR-9')
+})
+
+// ── The account badge ──────────────────────────────────────────────────
+const LABELS = { accounts: ['work.example.com=WORK', 'gmail.com=PERSONAL'] }
+const account = (email: string | null, org: string | null = null) =>
+  JSON.stringify({ oauthAccount: { ...(email && { emailAddress: email }), ...(org && { organizationName: org }) } })
+
+test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work', HOME: '/Users/t' })
+  w.files['/Users/t/.claude-work/.claude.json'] = account('you@work.example.com', 'Work Co')
+  w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+  await job($, w, 'go', 0.01)
+  await shows(band($), exactly('[WORK] you@work.example.com'))
+  await shows(pane($), exactly('[WORK] you@work.example.com'))
+  expect(await color(band($), exactly('[WORK] you@work.example.com'))).toBe('warning')
+  expect(await color(pane($), exactly('[WORK] you@work.example.com'))).toBe('warning')
+})
+
+for (const [email, badge, colour] of [
+  ['you@gmail.com', '[PERSONAL] you@gmail.com', 'success'],
+  ['You@Mail.Work.Example.COM', '[WORK] You@Mail.Work.Example.COM', 'warning'],
+] as const) {
+  test(`${email} from ~/.claude.json reads ${badge}`, { options: LABELS }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account(email)
+    await job($, w, 'go', 0.01)
+    await shows(band($), exactly(badge))
+    expect(await color(band($), exactly(badge))).toBe(colour)
+  })
+}
+
+const BADGES: Array<[string, Record<string, unknown>, string, string]> = [
+  ['no label: the email, dim', { accounts: ['work.example.com=WORK'] }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
+  ['hideEmail with a label', { ...LABELS, hideEmail: true }, account('you@work.example.com', 'Work Co'), '[WORK]'],
+  ['hideEmail without a label: the organization', { hideEmail: true }, account('you@gmail.com', 'Acme'), 'Acme'],
+  ['a custom label: orange', { accounts: 'gmail.com=Side; work.example.com=WORK' }, account('you@gmail.com'), '[Side] you@gmail.com'],
+]
+for (const [label, options, file, badge] of BADGES) {
+  test(`account badge: ${label}`, { options: options as never }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = file
+    await job($, w, 'go', 0.01)
+    await shows(band($), exactly(badge))
+    await shows(pane($), exactly(badge))
+    const ui = await band($)
+    const found = await ui.find({ type: 'Text', text: exactly(badge) })
+    expect(found?.props.color).toBe(badge.startsWith('[Side]') ? 'claude' : badge.startsWith('[WORK]') ? 'warning' : undefined)
+    expect(found?.props.dimColor).toBe(!badge.startsWith('['))
+    await ui.unmount()
+  })
+}
+
+const FALLBACKS: Array<[string, Record<string, string>, Record<string, string>, string]> = [
+  ['an organization only', { HOME: '/Users/t' }, { '/Users/t/.claude.json': account(null, 'Acme') }, 'Acme'],
+  ['no file under $CLAUDE_CONFIG_DIR', { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work/', HOME: '/Users/t' }, {}, '~/.claude-work'],
+  ['a broken file', { HOME: '/Users/t' }, { '/Users/t/.claude.json': '{ not json' }, '~/.claude'],
+  ['no environment', {}, {}, '~/.claude'],
+  ['a config dir outside home', { CLAUDE_CONFIG_DIR: '/opt/cc/conf', HOME: '/Users/t' }, {}, 'conf'],
+]
+for (const [label, env, files, badge] of FALLBACKS) {
+  test(`account badge falls back: ${label}`, { options: LABELS }, async ($, on) => {
+    const w = world(on, {}, 0, env)
+    Object.assign(w.files, files)
+    await job($, w, 'go', 0.01)
+    await shows(band($), exactly(badge), /^≈\$0\.01$/)
+    await shows(pane($), exactly(badge), /Session total ≈\$0\.01/)
+    expect(record(w)).toMatchObject({ cost: 0.01 })
+  })
+}
+
+test('the account file is read once, and the account is never saved', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+  await job($, w, 'one', 0.01)
+  await job($, w, 'two', 0.02)
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'three', 0.03)
+  expect(w.reads).toBe(1)
+  await shows(band($), exactly('[PERSONAL] you@gmail.com'))
+  expect(JSON.stringify([...w.store.values()])).not.toContain('gmail')
+})
+
+test('showAccount off hides the badge everywhere', { options: { ...LABELS, showAccount: false } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+  await job($, w, 'go', 0.01)
+  await hidden(band($), /gmail|PERSONAL/)
+  await hidden(pane($), /gmail|PERSONAL/)
+  await fits($, w)
+})
+
+for (const showAccount of [true, false]) {
+  test(`the panel fits with the badge, a budget bar and limits (showAccount ${showAccount})`, { options: { ...LABELS, showAccount } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+    w.limits = [five(30), { kind: 'seven_day', percentUsed: 11 }]
+    w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+    await prompt($, 'go')
+    await start($, 'm')
+    w.cost = 0.10
+    await step($, w, 'm', 1_000, 0)
+    await fits($, w)
+    await radarCmd($, 'budget 1')
+    await start($, 'h1', 'a1')
+    await fits($, w)
+    await complete($, 'h1', 'a1')
+    await complete($, 'm')
+    await fits($, w)
+  })
+}
+
+test('thinking time between prompts is not working time, nor what a limit rose meanwhile', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'first')
+  await start($, 'm')
+  const pct = await climb(w, 40, 1, 90)
+  await complete($, 'm')
+  // 30 s of thinking (under the 1-minute gap) while another session used 5 points
+  w.limits = [five(pct + 5)]
+  await w.clock.advance(30_000)
+  await prompt($, 'second')
+  await start($, 'm')
+  await climb(w, pct + 5, 1, 90)
+  await w.clock.advance(5_000)
+  // 6 points in ~3 minutes of work: ~23m left (with the 5 points it would be ~13m)
+  await shows(band($), /^ · ~2\dm left$/)
+})
+
+test('a reading at the same moment as the last one still counts its rise', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.limits = [five(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  let pct = 40
+  for (let s = 0; s < 190; s += 30) {
+    // while the poll waits for the agent list, a step reads the limits at the same moment,
+    // then the limit moves: the poll's reading (gap 0) carries the rise
+    const at = pct
+    w.onList = async () => {
+      await step($, w, 'm', 1_000, 0)
+      w.limits = [five(at + 1)]
+    }
+    await w.clock.advance(30_000)
+    pct += 1
+  }
+  await w.clock.advance(10_000)
+  await shows(band($), /~\d+m left/)
+})
+
+test('an open panel resizes when the budget bar comes and goes', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.10)
+  // not open yet: setting a budget doesn't open it
+  await radarCmd($, 'budget 1')
+  expect(w.opened.length).toBe(0)
+  await radarCmd($, 'budget off')
+  await radar($)
+  const opened = w.opened.length
+  const sized = async () => {
+    const ui: any = await pane($)
+    expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+    await ui.unmount()
+  }
+  await radarCmd($, 'budget 1')
+  expect(w.opened.length).toBe(opened + 1)
+  await sized()
+  // a new amount: same height, no resize
+  await radarCmd($, 'budget 2')
+  expect(w.opened.length).toBe(opened + 1)
+  await radarCmd($, 'budget off')
+  expect(w.opened.length).toBe(opened + 2)
+  await sized()
 })
