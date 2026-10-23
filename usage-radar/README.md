@@ -23,17 +23,17 @@ or inside claude code: `/plugin install usage-radar --marketplace Tejas274/claud
 
 ![the band above the prompt](docs/images/band.png)
 
-the band above the prompt has the model, and the tokens, cost and time for the whole session so far. under that is the session's name and a dim `this request: ≈$0.01 · 46k · 0:42 · 3 steps` line for just the prompt you're on. then what claude is doing right now, and meters for your spend limit (if your account has one), the 5h/weekly limits and context. the 5h/weekly limits show up after claude's first response, if your plan reports them.
+the band above the prompt is three lines. first the model, and the tokens, cost and time for the whole session so far, then your account label (and the session name, if you turn on `showName`). then what claude is doing right now, with the steps, helpers, to-do progress and a dim `last request ≈$0.01 · 46k tokens · 0:42` for just the prompt you're on. then meters for your spend limit (if your account has one, like `Spend $87.60 left 12%`), the 5h/weekly limits and context. the 5h/weekly limits show up after claude's first response, if your plan reports them. on a narrow terminal the meters that don't fit are left out, but spend and context always stay.
 
 when a meter goes past 80% you get a little warning, and again at 95%. for context it tells you to `/compact`.
 
-the session name is your `/rename` name if you gave one. otherwise it's a ticket ID from your first prompt (like `DEMO-42`, also from a jira `/browse/` link; things like `step-2` or `python-3` aren't tickets), otherwise the first 5 words of that prompt.
+the session name (off by default, turn it on with `showName`) is your `/rename` name if you gave one. otherwise it's a ticket ID from your first prompt (like `DEMO-42`, also from a jira `/browse/` link; things like `step-2` or `python-3` aren't tickets), otherwise the first 5 words of that prompt.
 
 #### agents panel (`/radar`)
 
 ![the /radar panel](docs/images/panel-demo.png)
 
-`/radar` opens a panel: the session name, cost / tokens / time for the session plus the "this request" line, the limits with when they reset (the spend limit also in dollars, like `$88.40 used · $11.60 left of $100`), and one row per agent with its own cost, tokens and time. helper rows read `type · description` (like `Explore · Find the config`), teammates show their name. an idle teammate shows `idle` and its clock pauses.
+`/radar` opens a panel: cost / tokens / time for the session (plus a `Left` tile with what's left of your spend limit, if you have one) and the "last request" line, the limits with when they reset (the spend limit also in dollars, like `$87.60 left` and `$12.40 of $100 used`), and one row per agent with its own cost, tokens and time. helper rows read `type · description` (like `Explore · Find the config`), teammates show their name. an idle teammate shows `idle` and its clock pauses.
 
 it also opens on its own when claude starts helper agents. on a wide terminal it docks on the right.
 
@@ -43,7 +43,7 @@ while a helper runs, its row is bold with a spinner and the finished ones are di
 
 #### spend limit
 
-if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$88.40 used · $11.60 left of $100  88%`. the band keeps it short, just the percent. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if a check fails it keeps the last reading for up to 3 minutes, then drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
+if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$87.60 left  12%`, with `$12.40 of $100 used` under it. over the limit it reads `$3.50 over  ⛔ 103%`. the band keeps it short: `Spend $87.60 left 12%`, never what you've used. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if a check fails it keeps the last reading for up to 3 minutes, then drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
 
 #### session budget
 
@@ -63,7 +63,7 @@ once a limit has been climbing for a few minutes of work, its meter also guesses
 
 ![the account badge](docs/images/account-badge.png)
 
-the band and the panel also show which account you're signed in as, like `[WORK] me@example.com`, with your own labels per email domain (see options). `hideEmail` shows just the label. it's read from claude code's own account file (`.claude.json` in your config dir). no email there (an API key, bedrock, vertex)? it shows the organization, or else the config dir like `~/.claude-work`, so you can still tell your setups apart.
+the band and the panel also show which account you're signed in as, like `[WORK]`, with your own labels per email domain (see options). the email stays hidden unless you turn on `showEmail` (`[WORK] me@example.com`), and an account without a label shows no badge at all. with `showEmail` an unlabelled account shows its email, and with no email there (an API key, bedrock, vertex) the organization, or else the config dir like `~/.claude-work`, so you can still tell your setups apart. it's read from claude code's own account file (`.claude.json` in your config dir).
 
 #### status line and resume
 
@@ -79,7 +79,8 @@ set them in `/config`, or in the `settings.json` of each config dir you use (`~/
 | --- | --- | --- |
 | `accounts` | labels per email domain, one entry per account as `domain=LABEL`. subdomains match too | none (just the email) |
 | `showAccount` | show the account in the band and the panel | `true` |
-| `hideEmail` | show only the label (or the organization), not the email | `false` |
+| `showEmail` | show the email next to the account label (and an unlabelled account's email) | `false` |
+| `showName` | show the session name (from your first prompt or `/rename`) in the band and the panel | `false` |
 | `defaultBudget` | the budget every new session starts with, in dollars. `0` = none | `0` |
 | `showSpend` | show your spend limit in dollars, read from anthropic once a minute. `false` = no request at all | `true` |
 
@@ -131,6 +132,7 @@ it reads your usage from anthropic using claude code's own login, once a minute,
 
 ### changelog
 
+- 2.4.0 a tidier three-line band (no separate context bar line, meters that never wrap), `last request` instead of `this request`, what's left of the spend limit up front (`$87.60 left`, a `Left` tile in the panel), the email hidden by default: `hideEmail` is replaced by `showEmail`, and unlabelled accounts show no badge unless `showEmail` is on; the session name is now opt-in with `showName`
 - 2.3.0 your real spend limit in dollars (used, left, cap) first in the limits, read from anthropic with claude code's login once a minute; `showSpend` turns it off
 - 2.2.0 burn-rate forecast for the 5h/weekly limits, session budget (/radar budget) with 80%/100% warnings, account badge with labels
 - 2.1.1 timer keeps ticking while background helpers work, live refresh, main row shows session totals, agents kept for the whole session, ticket IDs from Jira links and fewer false ones, teammate names, idle teammates pause their clock
