@@ -43,6 +43,8 @@ while a helper runs, its row is bold with a spinner and the finished ones are di
 
 #### spend limit
 
+![the spend limit in the /radar panel](docs/images/panel-spend.png)
+
 if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$87.60 left  12%`, with `$12.40 of $100 used` under it. over the limit it reads `$3.50 over  ⛔ 103%`. the band keeps it short: `Spend $87.60 left 12%`, never what you've used. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if a check fails it keeps the last reading for up to 3 minutes, then drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
 
 #### session budget
