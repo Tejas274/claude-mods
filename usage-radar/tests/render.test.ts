@@ -1996,7 +1996,8 @@ for (const cols of [100, 60]) {
     expect(columns(lines[2])).toBeLessThanOrEqual(cols - 4)
     expect(textOf(lines[2])).toMatch(/^Spend \$87\.60 left 12%/)
     await hidden(band($, cols), /% context/)
-    // at 100 columns the header fits too, with the badge and the name
+    // the header fits too; at 100 columns with the badge and the name
+    expect(columns(lines[0])).toBeLessThanOrEqual(cols - 4)
     if (cols === 100) {
       expect(textOf(lines[1])).toMatch(/1\/2 tasks/)
       expect(columns(lines[0])).toBeLessThanOrEqual(96)
@@ -2087,3 +2088,132 @@ test('an open panel grows when the dollars arrive for Claude Code\'s own Spend r
   expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
   await ui.unmount()
 })
+
+// The panel opened before the session had a name (a first prompt with no words in it gives
+// none): with showName the name row comes with the name
+const openedUnnamed = async ($: Engine, w: World) => {
+  await begin($, w)
+  await job($, w, '?', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  return { opened: w.opened.length, rows: w.opened.at(-1) ?? 0 }
+}
+const drawnAsOpened = async ($: Engine, w: World) => {
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+}
+
+// /radar opened before the first prompt: that prompt names the session and brings the Context
+// meter; the panel takes both at once, and after the job it is exactly as tall as it draws
+for (const showName of [true, false]) {
+  test(`an open panel takes the first prompt's rows${showName ? ', the name row too' : ''}`, { options: { showName } }, async ($, on) => {
+    const w = world(on)
+    await begin($, w)
+    await radar($)
+    const opened = w.opened.length
+    await prompt($, 'DEMO-7 tidy the docs')
+    expect(record(w)?.name).toBe('DEMO-7')
+    expect(w.opened.length).toBe(opened + 1)
+    // no agent row yet ("No agents yet"): the panel is a little taller than it draws, never shorter
+    let ui: any = await pane($)
+    expect(w.opened.at(-1)).toBeGreaterThanOrEqual(height(await ui.drawn()))
+    await ui.unmount()
+    await start($, 'm')
+    w.cost = 0.01
+    await step($, w, 'm', 1000, 0)
+    await complete($, 'm')
+    expect(w.opened.length).toBe(opened + 1)
+    await drawnAsOpened($, w)
+    if (showName) await shows(pane($), exactly('DEMO-7'))
+    else await hidden(pane($), /DEMO-7/)
+  })
+}
+
+test('with showName, a later prompt naming the session grows an open panel by its row', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  const { opened, rows } = await openedUnnamed($, w)
+  expect(record(w)?.name).toBeFalsy()
+  await prompt($, 'DEMO-7 tidy the docs')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 1)
+  await shows(pane($), exactly('DEMO-7'))
+  await drawnAsOpened($, w)
+})
+
+test('without showName, a later prompt naming the session leaves an open panel as it is', async ($, on) => {
+  const w = world(on)
+  const { opened } = await openedUnnamed($, w)
+  await prompt($, 'DEMO-7 tidy the docs')
+  expect(record(w)?.name).toBe('DEMO-7')
+  expect(w.opened.length).toBe(opened)
+  await hidden(pane($), /DEMO-7/)
+  await drawnAsOpened($, w)
+})
+
+// The 5h and weekly limits come with a reading after the first response: an open panel takes
+// their rows, and gives them back when they go
+test('an open panel grows when the 5h and weekly meters arrive with a reading', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  const rows = w.opened.at(-1) ?? 0
+  await measure($, [five(23), seven(9)])
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 4)
+  await drawnAsOpened($, w)
+  // the same reading again: no resize
+  await measure($, [five(24), seven(9)])
+  expect(w.opened.length).toBe(opened + 1)
+  await measure($, [])
+  expect(w.opened.at(-1)).toBe(rows)
+  await drawnAsOpened($, w)
+})
+
+test('with showName, /rename on an unnamed session grows an open panel once; a second /rename does not', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  const { opened, rows } = await openedUnnamed($, w)
+  await rename($, 'first pass')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 1)
+  await drawnAsOpened($, w)
+  await rename($, 'second pass')
+  expect(w.opened.length).toBe(opened + 1)
+  await shows(pane($), exactly('second pass'))
+  await drawnAsOpened($, w)
+})
+
+// The band header never runs past the band: it drops "tokens", then the clock, then the model,
+// never the cost; the badge and the name only get what's left
+const headerAt = async ($: Engine, cols: number, fitting = true) => {
+  const [header] = await bandLines($, cols)
+  const text = textOf(header)
+  if (fitting) expect(columns(header), `${cols} columns: ${text}`).toBeLessThanOrEqual(Math.max(30, cols - 4))
+  return text
+}
+
+for (const budget of [false, true]) {
+  test(`the band header drops tokens, the clock, then the model to fit${budget ? ', the budget cost staying' : ''}`, { options: { ...LABELS, showName: true } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+    await job($, w, 'go', 0.03, 31_000)
+    if (budget) await radarCmd($, 'budget 7')
+    const cost = budget ? '≈$0.03 / $7.00' : '≈$0.03'
+    const fixed = `◉ Usage Radar   ✳ Opus 5.5   # 31k tokens   ${cost}   ⏱ 0:00`
+    // everything fits, the badge and the name too
+    const wide = await headerAt($, fixed.length + 4 + 3 + '[WORK]'.length + 3 + 6)
+    expect(wide).toBe(`◉ Usage Radar✳ Opus 5.5# 31k tokens${cost}⏱ 0:00[WORK]go`)
+    // one column short of the fixed items: "tokens" goes, the badge and the name first
+    expect(await headerAt($, fixed.length + 3)).toBe(`◉ Usage Radar✳ Opus 5.5# 31k${cost}⏱ 0:00`)
+    // then the clock
+    const noClock = fixed.length - ' tokens'.length - '   ⏱ 0:00'.length
+    expect(await headerAt($, noClock + 4)).toBe(`◉ Usage Radar✳ Opus 5.5# 31k${cost}`)
+    // then the model; the badge gets the room that frees
+    expect(await headerAt($, noClock + 3)).toBe(`◉ Usage Radar# 31k${cost}[WORK]`)
+    // very narrow: the cost still shows (with a budget, the title and the cost alone are wider than the band)
+    expect(await headerAt($, 20, !budget)).toBe(`◉ Usage Radar# 31k${cost}`)
+  })
+}

@@ -1071,6 +1071,20 @@ const resizeIfOpen = async ($: EngineInterface, p: Live, cfg: Config): Promise<v
   }
 }
 
+// An open panel takes its new height only when it changed
+const resizeIfChanged = async ($: EngineInterface, before: Live, after: Live, cfg: Config): Promise<void> => {
+  if (panelRows(before, cfg) !== panelRows(after, cfg)) await resizeIfOpen($, after, cfg)
+}
+
+// /rename: the session gets its name (or a new one), saved; with showName an open panel takes
+// the name row when it first comes
+const nameSession = async ($: EngineInterface, cfg: Config, name: string, kind: NameKind): Promise<void> => {
+  const before = await read($, live)
+  const after = await update($, live, p => withName(p, name, kind))
+  await save($)
+  await resizeIfChanged($, before, after, cfg)
+}
+
 // ── The spend limit, read from Anthropic once a minute (also while idle) ──
 let spendTimer: Timer | undefined
 let spendAt: number | null = null // when the last check started, so checks stay a minute apart
@@ -1367,20 +1381,14 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', async ($, e, next) => {
     await syncSession($, cfg)
     const title = e.session_title?.trim()
-    if (title) {
-      await update($, live, p => withName(p, title, 'rename'))
-      await save($)
-    }
+    if (title) await nameSession($, cfg, title, 'rename')
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     await syncSession($, cfg)
     const title = e.session_title?.trim()
-    if (title) {
-      await update($, live, p => withName(p, title, 'rename'))
-      await save($)
-    }
+    if (title) await nameSession($, cfg, title, 'rename')
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -1390,10 +1398,7 @@ export const register: Register = (on, options) => {
     try {
       await syncSession($, cfg)
       const title = e.args.trim()
-      if (title) {
-        await update($, live, p => withName(p, title, 'rename'))
-        await save($)
-      }
+      if (title) await nameSession($, cfg, title, 'rename')
     } catch {
       // the rename itself already happened
     }
@@ -1432,6 +1437,8 @@ export const register: Register = (on, options) => {
 
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
+    // an open panel takes the rows this prompt brings (the name, the Context meter) at once, below
+    const before = await read($, live)
     await syncSession($, cfg)
     // the spend limit: checked now (at most once a minute), and from here on if it wasn't yet
     if (!spendTimer) startSpend($, cfg)
@@ -1445,7 +1452,11 @@ export const register: Register = (on, options) => {
       }
     }
 
-    if (e.command) return next(e) // slash commands like /radar don't start a new job
+    // slash commands like /radar don't start a new job
+    if (e.command) {
+      await resizeIfChanged($, before, await read($, live), cfg)
+      return next(e)
+    }
     const now = await $.clock.now()
     const usage = await $.session.usage()
     const cost = usage.cost?.usd ?? null
@@ -1466,6 +1477,7 @@ export const register: Register = (on, options) => {
     })
     $.ui.status(statusLine(p))
     for (const a of alerts) $.ui.toast(a)
+    await resizeIfChanged($, before, p, cfg)
 
     // the clock: ticks until the whole job is done
     startTicker($)
@@ -1609,6 +1621,7 @@ export const register: Register = (on, options) => {
   on('session.measure', async ($, e, next) => {
     try {
       const now = await $.clock.now()
+      const before = await read($, live)
       let alerts: string[] = []
       const p = await update($, live, p => {
         alerts = []
@@ -1618,6 +1631,8 @@ export const register: Register = (on, options) => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      // a meter came or went (the 5h or weekly limit): an open panel takes its new height
+      await resizeIfChanged($, before, p, cfg)
       void refreshSpend($, cfg)
     } catch {
       // ignore: the next reading catches up
@@ -1660,8 +1675,19 @@ export const register: Register = (on, options) => {
     // line 1: the header; the badge, then the name (when shown), get what's left of it, or go
     const model = m.model ? prettyModel(m.model) : '…'
     const cost = p.budget === null ? money(totalCost(p)) : budgetText(p)
-    const header = ['◉ Usage Radar', `✳ ${model}`, `# ${k(p.sessionTokens)} tokens`, cost, `⏱ ${sessionClock(p)}`]
-    let room = width - header.join('   ').length - 3
+    // when it doesn't fit, it drops the word "tokens", then the clock, then the model; never the
+    // cost or the title, so at the 30-column floor a long budget cost can still run past the band
+    const headerAt = (drop: number): string[] =>
+      [
+        '◉ Usage Radar',
+        drop < 3 ? `✳ ${model}` : '',
+        `# ${k(p.sessionTokens)}${drop < 1 ? ' tokens' : ''}`,
+        cost,
+        drop < 2 ? `⏱ ${sessionClock(p)}` : '',
+      ].filter(Boolean)
+    let drop = 0
+    while (drop < 3 && headerAt(drop).join('   ').length > width) drop++
+    let room = width - headerAt(drop).join('   ').length - 3
     const badge = badgeFor(p, cfg)
     const badgeText = badge && room >= 6 ? fit(badge.text, room) : null
     if (badgeText !== null) room -= badgeText.length + 3
@@ -1680,24 +1706,28 @@ export const register: Register = (on, options) => {
           <Text color={ORANGE} bold>
             ◉ Usage Radar
           </Text>
-          <Text>
-            <Text color={ORANGE}>✳ </Text>
-            <Text bold>{model}</Text>
-          </Text>
+          {drop < 3 && (
+            <Text>
+              <Text color={ORANGE}>✳ </Text>
+              <Text bold>{model}</Text>
+            </Text>
+          )}
           <Text>
             <Text dimColor># </Text>
             <Text bold>{k(p.sessionTokens)}</Text>
-            <Text dimColor> tokens</Text>
+            {drop < 1 && <Text dimColor> tokens</Text>}
           </Text>
           <Text>
             <Text color={p.budget === null ? AMBER : budgetColor(lvl)} bold>
               {cost}
             </Text>
           </Text>
-          <Text>
-            <Text dimColor>⏱ </Text>
-            <Text bold>{sessionClock(p)}</Text>
-          </Text>
+          {drop < 2 && (
+            <Text>
+              <Text dimColor>⏱ </Text>
+              <Text bold>{sessionClock(p)}</Text>
+            </Text>
+          )}
           {badge && badgeText !== null && (
             <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
               {badgeText}

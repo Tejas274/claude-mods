@@ -23,7 +23,7 @@ or inside claude code: `/plugin install usage-radar --marketplace Tejas274/claud
 
 ![the band above the prompt](docs/images/band.png)
 
-the band above the prompt is three lines. first the model, and the tokens, cost and time for the whole session so far, then your account label (and the session name, if you turn on `showName`). then what claude is doing right now, with the steps, helpers, to-do progress and a dim `last request ≈$0.01 · 46k tokens · 0:42` for just the prompt you're on. then meters for your spend limit (if your account has one, like `Spend $87.60 left 12%`), the 5h/weekly limits and context. the 5h/weekly limits show up after claude's first response, if your plan reports them. on a narrow terminal the meters that don't fit are left out, but spend and context always stay.
+the band above the prompt is three lines. first the model, and the tokens, cost and time for the whole session so far, then your account label (and the session name, if you turn on `showName`). then what claude is doing right now, with the steps, helpers, to-do progress and a dim `last request ≈$0.01 · 46k tokens · 0:42` for just the prompt you're on. then meters for your spend limit (if your account has one, like `Spend $87.60 left 12%`), the 5h/weekly limits and context. the 5h/weekly limits show up after claude's first response, if your plan reports them. on a narrow terminal the meters that don't fit are left out, but spend and context always stay. the header makes room the same way: first the word `tokens` goes, then the time, then the model, but the cost always stays.
 
 when a meter goes past 80% you get a little warning, and again at 95%. for context it tells you to `/compact`.
 
