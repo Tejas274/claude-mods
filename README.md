@@ -8,7 +8,7 @@ made these while figuring out how claude code mods work. two so far.
 
 ![usage-radar agents panel](usage-radar/docs/images/panel-pipeline.png)
 
-sits above the prompt and shows model, tokens, cost, a live timer, context and the 5h/weekly limits while claude works.
+sits above the prompt and shows model, tokens, cost, a live timer, context, your spend limit and the 5h/weekly limits while claude works.
 `/radar` opens a panel with every agent and roughly what each one costs, plus a session budget, burn-rate forecast and account badge.
 
 [more in the usage-radar README](usage-radar/README.md)
@@ -56,7 +56,7 @@ for a team: drop this in your repo's `.claude/settings.json` and everyone who op
 
 if your company manages claude code settings, an admin might need to allow outside marketplaces first.
 
-both of these only read what claude code already gives them. nothing gets sent anywhere.
+usage-radar reads your usage from anthropic with claude code's own login, once a minute (turn it off with `showSpend`), and nothing goes anywhere else. turn-receipt only reads what claude code already gives it, nothing gets sent anywhere.
 
 ### making one
 

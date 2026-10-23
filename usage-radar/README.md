@@ -23,7 +23,7 @@ or inside claude code: `/plugin install usage-radar --marketplace Tejas274/claud
 
 ![the band above the prompt](docs/images/band.png)
 
-the band above the prompt has the model, and the tokens, cost and time for the whole session so far. under that is the session's name and a dim `this request: ≈$0.01 · 46k · 0:42 · 3 steps` line for just the prompt you're on. then what claude is doing right now, and meters for context and the 5h/weekly limits. the 5h/weekly limits show up after claude's first response, if your plan reports them.
+the band above the prompt has the model, and the tokens, cost and time for the whole session so far. under that is the session's name and a dim `this request: ≈$0.01 · 46k · 0:42 · 3 steps` line for just the prompt you're on. then what claude is doing right now, and meters for your spend limit (if your account has one), the 5h/weekly limits and context. the 5h/weekly limits show up after claude's first response, if your plan reports them.
 
 when a meter goes past 80% you get a little warning, and again at 95%. for context it tells you to `/compact`.
 
@@ -33,13 +33,17 @@ the session name is your `/rename` name if you gave one. otherwise it's a ticket
 
 ![the /radar panel](docs/images/panel-demo.png)
 
-`/radar` opens a panel: the session name, cost / tokens / time for the session plus the "this request" line, the limits with when they reset, and one row per agent with its own cost, tokens and time. helper rows read `type · description` (like `Explore · Find the config`), teammates show their name. an idle teammate shows `idle` and its clock pauses.
+`/radar` opens a panel: the session name, cost / tokens / time for the session plus the "this request" line, the limits with when they reset (the spend limit also in dollars, like `$88.40 used · $11.60 left of $100`), and one row per agent with its own cost, tokens and time. helper rows read `type · description` (like `Explore · Find the config`), teammates show their name. an idle teammate shows `idle` and its clock pauses.
 
 it also opens on its own when claude starts helper agents. on a wide terminal it docks on the right.
 
 while a helper runs, its row is bold with a spinner and the finished ones are dimmed:
 
 ![the /radar panel with a helper running](docs/images/panel-running.png)
+
+#### spend limit
+
+if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$88.40 used · $11.60 left of $100  88%`. the band keeps it short, just the percent. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if a check fails it keeps the last reading for up to 3 minutes, then drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
 
 #### session budget
 
@@ -77,6 +81,7 @@ set them in `/config`, or in the `settings.json` of each config dir you use (`~/
 | `showAccount` | show the account in the band and the panel | `true` |
 | `hideEmail` | show only the label (or the organization), not the email | `false` |
 | `defaultBudget` | the budget every new session starts with, in dollars. `0` = none | `0` |
+| `showSpend` | show your spend limit in dollars, read from anthropic once a minute. `false` = no request at all | `true` |
 
 for example, labels for a work and a personal account:
 
@@ -108,7 +113,7 @@ for example, labels for a work and a personal account:
 <details>
 <summary>how the numbers work</summary>
 
-context and limits come straight from claude code. the cost is the real one (same as `/cost`), the per-agent split is an estimate so it has a ≈. the timer keeps going until the helpers finish too, not just the main agent, and it ticks every second while background helpers work after the main turn is over. cost and agent rows refresh about once a second while anything runs.
+context and the 5h/weekly limits come straight from claude code. the dollar spend limit comes from anthropic (the same numbers claude.ai shows), read with claude code's own login. the cost is the real one (same as `/cost`), the per-agent split is an estimate so it has a ≈. the timer keeps going until the helpers finish too, not just the main agent, and it ticks every second while background helpers work after the main turn is over. cost and agent rows refresh about once a second while anything runs.
 
 tokens are new tokens: input + cache writes + output. cache reads aren't counted, because every step re-reads the same history from the cache and counting it again each time would blow the number up. so it won't match the context size.
 
@@ -120,12 +125,13 @@ time is working time: from your prompt until every agent is done. idle gaps betw
 
 totals are saved per session in the mod's own local store, so `claude --resume` (even days later) carries on from where you left off. `/clear` starts fresh. sessions you haven't used for 90 days are pruned. the store also holds the session name, which can be the first 5 words of your first prompt.
 
-it only reads claude code's own numbers, nothing is sent anywhere. the account's email and organization are read only to draw the badge: they're never stored or sent.
+it reads your usage from anthropic using claude code's own login, once a minute, and nothing goes anywhere else. the dollar amounts stay in memory, they're never saved. don't want that request? set `showSpend` to `false`. the account's email and organization are read only to draw the badge: they're never stored or sent.
 
 </details>
 
 ### changelog
 
+- 2.3.0 your real spend limit in dollars (used, left, cap) first in the limits, read from anthropic with claude code's login once a minute; `showSpend` turns it off
 - 2.2.0 burn-rate forecast for the 5h/weekly limits, session budget (/radar budget) with 80%/100% warnings, account badge with labels
 - 2.1.1 timer keeps ticking while background helpers work, live refresh, main row shows session totals, agents kept for the whole session, ticket IDs from Jira links and fewer false ones, teammate names, idle teammates pause their clock
 - 2.1.0 session totals that survive --resume, session name, agent names, theme colours

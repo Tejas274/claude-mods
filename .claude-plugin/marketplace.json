@@ -8,7 +8,7 @@
     {
       "name": "usage-radar",
       "source": "./usage-radar",
-      "description": "Session cost, tokens and live timer above the prompt (saved across --resume), a per-request line, auto session name, plan limits (5-hour, weekly) and context fill with alerts, a burn-rate forecast, a session budget (/radar budget), an account badge, a status line, and an agents panel (/radar)."
+      "description": "Session cost, tokens and live timer above the prompt (saved across --resume), a per-request line, auto session name, your spend limit in dollars, plan limits (5-hour, weekly) and context fill with alerts, a burn-rate forecast, a session budget (/radar budget), an account badge, a status line, and an agents panel (/radar)."
     },
     {
       "name": "turn-receipt",
