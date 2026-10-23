@@ -49,7 +49,8 @@ export type Earlier = { agents: number; cost: number; tokens: number }
 /** How the session got its name: /rename, a ticket ID in the first prompt, or its first words */
 export type NameKind = 'rename' | 'ticket' | 'words'
 
-/** The signed-in account, read once from the config file (not saved) */
+/** The signed-in account, read once from the config file (not saved). configDir is never drawn:
+ * a config folder name can reveal the company (like ~/.claude-acme) */
 export type Account = { email: string | null; org: string | null; configDir: string }
 
 /** The account's dollar spend limit, from Anthropic's usage endpoint (major units; never saved) */
@@ -89,7 +90,8 @@ export type Saved = {
  * helper agent are done; job fields (steps, costUsd/baseCost, jobTokens, startedAt) start
  * over each job. Session fields (sessionId, name, sessionCost, sessionTokens, priorMs,
  * sessionSteps, helperIds, agents, earlier) add up over the whole session and are saved,
- * with the budget (budget, budgetFired). Pace, account and spend live only in memory.
+ * with the budget (budget, budgetFired). Pace, account and spend live only in memory;
+ * private mode lives in memory too, and under its own store key (`private`: true or false).
  */
 export type Live = {
   isRunning: boolean
@@ -141,6 +143,8 @@ export type Live = {
   account: Account | null
   /** the account's spend limit in dollars, read from Anthropic once a minute (null: none; not saved) */
   spend: Spend | null
+  /** /radar private: email and session name hidden (global, stored as one boolean, not per session) */
+  private: boolean
 }
 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }

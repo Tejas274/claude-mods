@@ -37,16 +37,17 @@ const EMPTY: Live = {
   pace: { wall: null, active: 0, kinds: {} },
   account: null,
   spend: null,
+  private: false,
 }
-const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v5' })
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v6' })
 
 const PANE = 'radar-agents'
-// tiles (4) + last request (1) + summary (2) + the limits block (2 + 2 per meter, when
-// shown) + 3 rows per agent + the "+N earlier" line (2, when shown) + session total (2), and the dock width.
-// `extra`: the name row, the account row, the budget bar under the cost tile and the Spend
-// dollars line (1 each, when shown)
+// tiles (4) + summary (2) + the limits block (2 + 2 per meter, when shown) + 3 rows per
+// agent + the "+N earlier" line (2, when shown) + session total (2), and the dock width.
+// `extra`: the name row, the account row, the budget bar under the cost tile, the Spend
+// dollars line and the last request (1 each, when shown)
 const paneRows = (agents: number, limits: number, hasMore = false, extra = 0): number =>
-  11 + extra + (limits > 0 ? 2 + 2 * limits : 0) + 3 * Math.max(1, agents) + (hasMore ? 2 : 0)
+  10 + extra + (limits > 0 ? 2 + 2 * limits : 0) + 3 * Math.max(1, agents) + (hasMore ? 2 : 0)
 const PANE_COLUMNS = 64
 const ROWS = 8 // helper rows on screen; the rest share one line
 const TICK_MS = 250
@@ -73,6 +74,7 @@ const REARM_MS = 60 * 60_000 // the warnings can come again once it's an hour aw
 const SAVE_MS = 15_000
 const PRUNE_MS = 90 * 24 * 60 * 60 * 1000 // sessions unused for 90 days are forgotten
 const KEY = (id: string): string => `session:${id}`
+const PRIVATE_KEY = 'private' // /radar private: true or false, for every session (never the email)
 
 // Colours: theme keys, not raw hex, so they stay readable on light and dark terminals
 const ORANGE = 'claude'
@@ -193,10 +195,11 @@ const panelRows = (p: Live, cfg: Config): number =>
     (main(p) ? 1 : 0) + helperRows(p).shown.length,
     meters(p).length,
     earlierLine(p) !== null,
-    (cfg.showName && p.name ? 1 : 0) +
+    (nameShown(p, cfg) ? 1 : 0) +
       (badgeFor(p, cfg) ? 1 : 0) +
       (p.budget !== null ? 1 : 0) +
-      (meters(p).some(m => m.spend) ? 1 : 0),
+      (meters(p).some(m => m.spend) ? 1 : 0) +
+      (hasRequest(p) ? 1 : 0),
   )
 
 // The clock stands still when nobody works: the job is over, or every running agent is idle
@@ -237,6 +240,9 @@ const sessionAgents = (p: Live): number => (main(p) || p.sessionSteps || p.sessi
 
 // 1 → "1 step", 3 → "3 steps"
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+
+// The session made its first model request (until then there's no last request to show)
+const hasRequest = (p: Live): boolean => p.sessionTokens > 0
 
 // Just the last request: "last request ≈$0.20 · 11k tokens · 0:05"
 const lastRequest = (p: Live): string => `last request ${money(jobCost(p))} · ${k(p.jobTokens)} tokens · ${elapsed(p)}`
@@ -414,6 +420,7 @@ const freshSession = (p: Live, id: string, saved: Saved | null, ledger: number |
     pace: p.pace,
     account: p.account,
     spend: p.spend,
+    private: p.private,
     lastLedger: ledger,
     ...(saved && {
       name: saved.name,
@@ -874,8 +881,8 @@ const configOf = (o: PluginOptions): Config => {
   return {
     accounts,
     showAccount: o.showAccount !== false,
-    showEmail: o.showEmail === true,
-    showName: o.showName === true,
+    showEmail: o.showEmail !== false,
+    showName: o.showName !== false,
     defaultBudget: typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? budget : null,
     showSpend: o.showSpend !== false,
   }
@@ -893,16 +900,27 @@ const labelFor = (email: string, accounts: Config['accounts']): string | null =>
 // WORK amber, PERSONAL green, any other label orange
 const labelColor = (label: string): string => (/^work$/i.test(label) ? AMBER : /^personal$/i.test(label) ? GREEN : ORANGE)
 
-// "[WORK]", or with showEmail "[WORK] me@acme.com". No label: with showEmail just who it is
-// (email, else organization, else config dir); without it no badge at all (null)
-const badgeOf = (a: Account, cfg: Config): { text: string; color: string | undefined } | null => {
+// The dim hint next to a shown email, when there's room for all of it
+const HINT = '(/radar private to hide)'
+
+// The account badge: its text, its colour (a label's; none for a bare email) and whether it shows the email
+type Badge = { text: string; color: string | undefined; hasEmail: boolean }
+
+// "[WORK] me@acme.com", or "[WORK]" with no email (showEmail off, private mode, none known).
+// No label: just the email, else no badge at all (null). Never the organization or the config
+// dir: those can name the company
+const badgeOf = (a: Account, cfg: Config, hide: boolean): Badge | null => {
+  const email = cfg.showEmail && !hide && !!a.email
   const label = a.email ? labelFor(a.email, cfg.accounts) : null
-  if (label) return { text: cfg.showEmail ? `[${label}] ${a.email}` : `[${label}]`, color: labelColor(label) }
-  return cfg.showEmail ? { text: a.email ?? a.org ?? a.configDir, color: undefined } : null
+  if (label) return { text: email ? `[${label}] ${a.email}` : `[${label}]`, color: labelColor(label), hasEmail: email }
+  return email && a.email ? { text: a.email, color: undefined, hasEmail: true } : null
 }
 // The badge the band and the panel draw, or null (showAccount off, no account yet, or nothing to show)
-const badgeFor = (p: Live, cfg: Config): { text: string; color: string | undefined } | null =>
-  cfg.showAccount && p.account ? badgeOf(p.account, cfg) : null
+const badgeFor = (p: Live, cfg: Config): Badge | null =>
+  cfg.showAccount && p.account ? badgeOf(p.account, cfg, p.private) : null
+
+// The session name the band and the panel draw, or null (showName off, private mode, no name yet)
+const nameShown = (p: Live, cfg: Config): string | null => (cfg.showName && !p.private ? p.name : null)
 
 // The two fields we use from Claude Code's account file; anything odd counts as missing
 const parseAccountFile = (text: string): { email: string | null; org: string | null } => {
@@ -916,7 +934,8 @@ const parseAccountFile = (text: string): { email: string | null; org: string | n
   }
 }
 
-// "/Users/me/.claude-work" → "~/.claude-work"; outside home just the folder's name
+// "/Users/me/.claude-work" → "~/.claude-work"; outside home just the folder's name. Never drawn:
+// a config folder name can reveal the company (like ~/.claude-acme)
 const shortDir = (path: string, home: string | undefined): string => {
   const dir = path.replace(/\/+$/, '') || path
   const h = home?.replace(/\/+$/, '')
@@ -1014,6 +1033,17 @@ const load = async ($: EngineInterface, id: string): Promise<Saved | null> => {
   }
 }
 
+// Private mode, for every session: on only when the store says true (anything else is off).
+// Only that one boolean is kept, never the email or the name
+const loadPrivate = async ($: EngineInterface): Promise<void> => {
+  try {
+    const stored = (await $.store.get(PRIVATE_KEY)) === true
+    await update($, live, p => (p.private === stored ? p : { ...p, private: stored }))
+  } catch {
+    // keep what we have
+  }
+}
+
 // Forget sessions not used for 90 days (and records we can't read). Other keys are left alone.
 const prune = async ($: EngineInterface, current: string): Promise<void> => {
   try {
@@ -1053,9 +1083,10 @@ const detectAccount = async ($: EngineInterface): Promise<Account> => {
     try {
       found = parseAccountFile(String(await $.fs.read(file)))
     } catch {
-      // no file (an API key, Bedrock, Vertex...): the badge shows the config dir
+      // no file (an API key, Bedrock, Vertex...): no email, so no badge unless labelled
     }
   }
+  // configDir is kept but never drawn (a config folder name can reveal the company)
   return { ...found, configDir: dir ? shortDir(dir, home) : '~/.claude' }
 }
 
@@ -1076,8 +1107,8 @@ const resizeIfChanged = async ($: EngineInterface, before: Live, after: Live, cf
   if (panelRows(before, cfg) !== panelRows(after, cfg)) await resizeIfOpen($, after, cfg)
 }
 
-// /rename: the session gets its name (or a new one), saved; with showName an open panel takes
-// the name row when it first comes
+// /rename: the session gets its name (or a new one), saved; while the name is shown an open panel
+// takes the name row when it first comes
 const nameSession = async ($: EngineInterface, cfg: Config, name: string, kind: NameKind): Promise<void> => {
   const before = await read($, live)
   const after = await update($, live, p => withName(p, name, kind))
@@ -1363,9 +1394,14 @@ export const register: Register = (on, options) => {
 
   // ── Startup: pick up this session's totals, add the /radar command ─────
   on('session.start', async ($, e, next) => {
+    await loadPrivate($)
     await syncSession($, cfg)
     startSpend($, cfg)
-    await $.command.register({ name: 'radar', description: 'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session' })
+    await $.command.register({
+      name: 'radar',
+      description:
+        'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
+    })
     return next(e)
   })
 
@@ -1405,8 +1441,25 @@ export const register: Register = (on, options) => {
     return r
   }).catch(($, e, next) => next(e))
 
-  // ── /radar opens the panel; /radar budget <amount|off> sets this session's budget ─
+  // ── /radar opens the panel; /radar budget <amount|off> sets this session's budget;
+  //    /radar private [on|off] hides (or shows again) the email and the session name, every session ─
   on('command.run', { command: 'radar' }, async ($, e) => {
+    const pm = /^private\b\s*(.*)$/i.exec(e.args.trim())
+    if (pm) {
+      const a = (pm[1] ?? '').trim().toLowerCase()
+      if (a !== '' && a !== 'on' && a !== 'off') return { text: 'Usage Radar: use /radar private or /radar private off' }
+      const hide = a !== 'off'
+      const before = await read($, live)
+      const after = await update($, live, p => (p.private === hide ? p : { ...p, private: hide }))
+      try {
+        await $.store.set(PRIVATE_KEY, hide)
+      } catch {
+        // not kept for the next session; this one still changes
+      }
+      // the name row (and an unlabelled badge) came or went: an open panel takes its new height
+      await resizeIfChanged($, before, after, cfg)
+      return { text: hide ? 'Private mode on: email and session name hidden.' : 'Private mode off: email and session name shown.' }
+    }
     const m = /^budget\b\s*(.*)$/i.exec(e.args.trim())
     if (!m) {
       const p = await read($, live)
@@ -1530,6 +1583,8 @@ export const register: Register = (on, options) => {
       const now = await $.clock.now()
       const fresh = freshTokens(u)
       let alerts: string[] = []
+      // the first request brings the last request row (and a reading may bring meters): an open panel takes them
+      const before = await read($, live)
       const p = await update($, live, p => {
         const counted = withWorking(withLedger({ ...p, window: usage.context.window || p.window }, usage.cost?.usd ?? null), id, now)
         const base = withAgent(
@@ -1550,6 +1605,7 @@ export const register: Register = (on, options) => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      await resizeIfChanged($, before, p, cfg)
       await saveSoon($)
     }
     return result
@@ -1672,7 +1728,8 @@ export const register: Register = (on, options) => {
     const lvl = p.budget === null ? 0 : budgetLevel(p.sessionCost, p.budget)
     const border = lvl >= 100 ? RED : lvl >= 80 ? AMBER : p.isRunning ? ORANGE : 'subtle'
 
-    // line 1: the header; the badge, then the name (when shown), get what's left of it, or go
+    // line 1: the header; the badge, then the name (when shown), then the dim private-mode hint get
+    // what's left of it, or go (the hint whole or not at all)
     const model = m.model ? prettyModel(m.model) : '…'
     const cost = p.budget === null ? money(totalCost(p)) : budgetText(p)
     // when it doesn't fit, it drops the word "tokens", then the clock, then the model; never the
@@ -1691,11 +1748,16 @@ export const register: Register = (on, options) => {
     const badge = badgeFor(p, cfg)
     const badgeText = badge && room >= 6 ? fit(badge.text, room) : null
     if (badgeText !== null) room -= badgeText.length + 3
-    const name = cfg.showName && p.name && room >= 6 ? fit(p.name, Math.min(28, room)) : null
+    const shownName = nameShown(p, cfg)
+    const name = shownName && room >= 6 ? fit(shownName, Math.min(28, room)) : null
+    const used =
+      headerAt(drop).join('   ').length + (badgeText !== null ? 3 + badgeText.length : 0) + (name !== null ? 3 + name.length : 0)
+    const hint = !!badge?.hasEmail && badgeText === badge.text && used + 1 + HINT.length <= width
 
-    // line 2: what's going on, then the steps, helpers, tasks and the last request (dim)
+    // line 2: what's going on, then the steps, helpers, tasks and the last request (dim, once there is one)
     const doingText = fit(doing, Math.max(10, width - 40))
-    const tail = fit(`  ·  ${plural(p.sessionSteps, 'step')}${crew}${tasks}  ·  ${lastRequest(p)}`, Math.max(0, width - 2 - doingText.length))
+    const last = hasRequest(p) ? `  ·  ${lastRequest(p)}` : ''
+    const tail = fit(`  ·  ${plural(p.sessionSteps, 'step')}${crew}${tasks}${last}`, Math.max(0, width - 2 - doingText.length))
 
     // line 3: the meters that fit
     const shown = bandMeters(p, width)
@@ -1728,9 +1790,17 @@ export const register: Register = (on, options) => {
               <Text bold>{sessionClock(p)}</Text>
             </Text>
           )}
-          {badge && badgeText !== null && (
+          {badge && badgeText !== null && !hint && (
             <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
               {badgeText}
+            </Text>
+          )}
+          {badge && badgeText !== null && hint && (
+            <Text>
+              <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+                {badgeText}
+              </Text>
+              <Text dimColor>{` ${HINT}`}</Text>
             </Text>
           )}
           {name !== null && <Text bold>{name}</Text>}
@@ -1812,6 +1882,9 @@ export const register: Register = (on, options) => {
     const rows = helperRows(p)
     const more = earlierLine(p)
     const badge = badgeFor(p, cfg)
+    // the dim private-mode hint after a shown email, only when all of it fits on the badge's line
+    const hint = !!badge?.hasEmail && badge.text.length + 1 + HINT.length <= width
+    const name = nameShown(p, cfg)
     const lvl = p.budget === null ? 0 : budgetLevel(p.sessionCost, p.budget)
     // what's left of the spend limit gets its own tile, when the panel is wide enough for four
     const left = p.spend && width >= 48 ? spendLeft(p.spend) : null
@@ -1819,12 +1892,20 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
-          {badge && (
+          {badge && !hint && (
             <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
               {fit(badge.text, width)}
             </Text>
           )}
-          {cfg.showName && p.name ? <Text bold>{fit(p.name, width)}</Text> : null}
+          {badge && hint && (
+            <Text>
+              <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+                {badge.text}
+              </Text>
+              <Text dimColor>{` ${HINT}`}</Text>
+            </Text>
+          )}
+          {name ? <Text bold>{fit(name, width)}</Text> : null}
           <Box flexDirection="row" gap={1}>
             {p.budget === null
               ? tile('cost', 'Cost', money(totalCost(p)), AMBER)
@@ -1833,7 +1914,7 @@ export const register: Register = (on, options) => {
             {tile('time', 'Time', sessionClock(p), p.isRunning ? ORANGE : undefined)}
             {p.spend && left && tile('left', left.title, left.text, levelColor(p.spend.pct))}
           </Box>
-          <Text dimColor>{fit(lastRequest(p), width)}</Text>
+          {hasRequest(p) && <Text dimColor>{fit(lastRequest(p), width)}</Text>}
         </Box>
 
         <Text>

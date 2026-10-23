@@ -142,6 +142,8 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     fetchedAt: [] as number[],
     reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string },
     hold: null as null | Promise<void>,
+    /** the store fails every get and set */
+    storeBroken: false,
   }
   on('session.authorize', () => {
     w.authorized++
@@ -165,8 +167,12 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return (text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }) as never
   })
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }) as never)
-  on('store.get', (_$: any, e: any) => ({ value: w.store.get(e.key) }) as never)
+  on('store.get', (_$: any, e: any) => {
+    if (w.storeBroken) throw new Error('store down')
+    return { value: w.store.get(e.key) } as never
+  })
   on('store.set', (_$: any, e: any) => {
+    if (w.storeBroken) throw new Error('store down')
     w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined } as never
   })
@@ -1201,7 +1207,7 @@ const LABELS = { accounts: ['work.example.com=WORK', 'gmail.com=PERSONAL'] }
 const account = (email: string | null, org: string | null = null) =>
   JSON.stringify({ oauthAccount: { ...(email && { emailAddress: email }), ...(org && { organizationName: org }) } })
 
-test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge', { options: LABELS }, async ($, on) => {
+test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge (showEmail off)', { options: { ...LABELS, showEmail: false } }, async ($, on) => {
   const w = world(on, {}, 0, { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work', HOME: '/Users/t' })
   w.files['/Users/t/.claude-work/.claude.json'] = account('you@work.example.com', 'Work Co')
   w.files['/Users/t/.claude.json'] = account('you@gmail.com')
@@ -1210,17 +1216,17 @@ test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge', { opti
   await shows(pane($), exactly('[WORK]'))
   expect(await color(band($), exactly('[WORK]'))).toBe('warning')
   expect(await color(pane($), exactly('[WORK]'))).toBe('warning')
-  // the email is hidden by default
+  // showEmail off hides the email
   await hidden(band($), /@/)
   await hidden(pane($), /@/)
 })
 
-// showEmail: the email next to the label
+// by default the email shows next to the label
 for (const [email, badge, colour] of [
   ['you@gmail.com', '[PERSONAL] you@gmail.com', 'success'],
   ['You@Mail.Work.Example.COM', '[WORK] You@Mail.Work.Example.COM', 'warning'],
 ] as const) {
-  test(`${email} from ~/.claude.json reads ${badge}`, { options: { ...LABELS, showEmail: true } }, async ($, on) => {
+  test(`${email} from ~/.claude.json reads ${badge}`, { options: LABELS }, async ($, on) => {
     const w = world(on, {}, 0, { HOME: '/Users/t' })
     w.files['/Users/t/.claude.json'] = account(email)
     await job($, w, 'go', 0.01)
@@ -1230,14 +1236,15 @@ for (const [email, badge, colour] of [
 }
 
 const BADGES: Array<[string, Record<string, unknown>, string, string | null]> = [
-  ['no label: no badge', { accounts: ['work.example.com=WORK'] }, account('you@gmail.com', 'Acme'), null],
-  ['no label, showEmail: the email, dim', { accounts: ['work.example.com=WORK'], showEmail: true }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
-  ['a label: just the label', LABELS, account('you@work.example.com', 'Work Co'), '[WORK]'],
-  ['a label, showEmail: the label and the email', { ...LABELS, showEmail: true }, account('you@work.example.com', 'Work Co'), '[WORK] you@work.example.com'],
+  ['no label, by default: the email, dim', { accounts: ['work.example.com=WORK'] }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
+  ['no label, showEmail off: no badge', { accounts: ['work.example.com=WORK'], showEmail: false }, account('you@gmail.com', 'Acme'), null],
+  ['no label, showEmail on: the email, dim', { accounts: ['work.example.com=WORK'], showEmail: true }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
+  ['a label, by default: the label and the email', LABELS, account('you@work.example.com', 'Work Co'), '[WORK] you@work.example.com'],
+  ['a label, showEmail off: just the label', { ...LABELS, showEmail: false }, account('you@work.example.com', 'Work Co'), '[WORK]'],
   ['no label and no email: no badge', LABELS, account(null, 'Acme'), null],
-  ['no label and no email, showEmail: the organization', { ...LABELS, showEmail: true }, account(null, 'Acme'), 'Acme'],
-  ['a custom label: orange', { accounts: 'gmail.com=Side; work.example.com=WORK' }, account('you@gmail.com'), '[Side]'],
-  ['a custom label, showEmail', { accounts: 'gmail.com=Side', showEmail: true }, account('you@gmail.com'), '[Side] you@gmail.com'],
+  ['no label and no email, showEmail on: still no badge, never the organization', { ...LABELS, showEmail: true }, account(null, 'Acme'), null],
+  ['a custom label, showEmail off: orange', { accounts: 'gmail.com=Side; work.example.com=WORK', showEmail: false }, account('you@gmail.com'), '[Side]'],
+  ['a custom label, by default', { accounts: 'gmail.com=Side' }, account('you@gmail.com'), '[Side] you@gmail.com'],
 ]
 for (const [label, options, file, badge] of BADGES) {
   test(`account badge: ${label}`, { options: options as never }, async ($, on) => {
@@ -1259,31 +1266,28 @@ for (const [label, options, file, badge] of BADGES) {
   })
 }
 
-const FALLBACKS: Array<[string, Record<string, string>, Record<string, string>, string]> = [
-  ['an organization only', { HOME: '/Users/t' }, { '/Users/t/.claude.json': account(null, 'Acme') }, 'Acme'],
-  ['no file under $CLAUDE_CONFIG_DIR', { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work/', HOME: '/Users/t' }, {}, '~/.claude-work'],
-  ['a broken file', { HOME: '/Users/t' }, { '/Users/t/.claude.json': '{ not json' }, '~/.claude'],
-  ['no environment', {}, {}, '~/.claude'],
-  ['a config dir outside home', { CLAUDE_CONFIG_DIR: '/opt/cc/conf', HOME: '/Users/t' }, {}, 'conf'],
+// No email to show: no badge, never the organization or the config dir (they can name the company)
+const FALLBACKS: Array<[string, Record<string, string>, Record<string, string>]> = [
+  ['an organization only', { HOME: '/Users/t' }, { '/Users/t/.claude.json': account(null, 'Acme') }],
+  ['no file under $CLAUDE_CONFIG_DIR', { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work/', HOME: '/Users/t' }, {}],
+  ['a broken file', { HOME: '/Users/t' }, { '/Users/t/.claude.json': '{ not json' }],
+  ['no environment', {}, {}],
+  ['a config dir outside home', { CLAUDE_CONFIG_DIR: '/opt/cc/conf', HOME: '/Users/t' }, {}],
 ]
-// with showEmail; without it there's no email to show, so no badge
-for (const [label, env, files, badge] of FALLBACKS) {
-  test(`account badge falls back: ${label}`, { options: { ...LABELS, showEmail: true } }, async ($, on) => {
-    const w = world(on, {}, 0, env)
-    Object.assign(w.files, files)
-    await job($, w, 'go', 0.01)
-    await shows(band($), exactly(badge), /^≈\$0\.01$/)
-    await shows(pane($), exactly(badge), /Session total ≈\$0\.01/)
-    expect(record(w)).toMatchObject({ cost: 0.01 })
-  })
-  test(`no badge by default: ${label}`, { options: LABELS }, async ($, on) => {
-    const w = world(on, {}, 0, env)
-    Object.assign(w.files, files)
-    await job($, w, 'go', 0.01)
-    await hidden(band($), exactly(badge))
-    await hidden(pane($), exactly(badge))
-    await fits($, w)
-  })
+for (const [label, env, files] of FALLBACKS) {
+  for (const [kind, options] of [['by default', LABELS], ['showEmail on', { ...LABELS, showEmail: true }]] as const) {
+    test(`no badge without an email (${kind}): ${label}`, { options: options as never }, async ($, on) => {
+      const w = world(on, {}, 0, env)
+      Object.assign(w.files, files)
+      await job($, w, 'go', 0.01)
+      await shows(band($), /^≈\$0\.01$/)
+      await shows(pane($), /Session total ≈\$0\.01/)
+      await hidden(band($), /Acme|claude|conf|\[|radar private/)
+      await hidden(pane($), /Acme|claude|conf|\[|radar private/)
+      expect(record(w)).toMatchObject({ cost: 0.01 })
+      await fits($, w)
+    })
+  }
 }
 
 test('the account file is read once, and the account is never saved', { options: LABELS }, async ($, on) => {
@@ -1295,7 +1299,7 @@ test('the account file is read once, and the account is never saved', { options:
   w.cost = 0
   await job($, w, 'three', 0.03)
   expect(w.reads).toBe(1)
-  await shows(band($), exactly('[PERSONAL]'))
+  await shows(band($), exactly('[PERSONAL] you@gmail.com'))
   expect(JSON.stringify([...w.store.values()])).not.toContain('gmail')
 })
 
@@ -1908,7 +1912,7 @@ test('asking for the login failing keeps the last reading like any failed check'
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-// 2.4.0: a three-line band, the name and email opt-in, the Left tile
+// 2.4.0: a three-line band, the name and email shown by default, the Left tile
 // ════════════════════════════════════════════════════════════════════════════
 // The text a drawn element shows, and how many columns it takes (a row: its children + gaps)
 const textOf = (el: any): string =>
@@ -1929,7 +1933,7 @@ const bandLines = async ($: Engine, bodyColumns: number): Promise<any[]> => {
   return (root.children ?? []).filter((c: any) => c && typeof c === 'object')
 }
 
-test('the name is hidden by default, in the band and the panel', { options: LABELS }, async ($, on) => {
+test('showName off hides the name, in the band and the panel', { options: { ...LABELS, showName: false } }, async ($, on) => {
   const w = world(on)
   await job($, w, 'DEMO-142 fix the login', 0.01)
   expect(record(w)?.name).toBe('DEMO-142')
@@ -1938,7 +1942,7 @@ test('the name is hidden by default, in the band and the panel', { options: LABE
   await fits($, w)
 })
 
-test('showName shows it in the band header and the panel', { options: { ...LABELS, showName: true } }, async ($, on) => {
+test('by default the name shows in the band header and the panel', { options: LABELS }, async ($, on) => {
   const w = world(on)
   await job($, w, 'DEMO-142 fix the login', 0.01)
   const [header] = await bandLines($, 100)
@@ -1947,7 +1951,7 @@ test('showName shows it in the band header and the panel', { options: { ...LABEL
   await fits($, w)
 })
 
-test('by default the badge is just the label, on the band header line, and no email anywhere', { options: LABELS }, async ($, on) => {
+test('showEmail off: the badge is just the label, on the band header line, and no email anywhere', { options: { ...LABELS, showEmail: false, showName: false } }, async ($, on) => {
   const w = world(on, {}, 0, { HOME: '/Users/t' })
   w.files['/Users/t/.claude.json'] = account('you@work.example.com', 'Work Co')
   await job($, w, 'go', 0.01)
@@ -1958,7 +1962,7 @@ test('by default the badge is just the label, on the band header line, and no em
   await fits($, w)
 })
 
-test('an unlabelled account shows no badge by default', { options: LABELS }, async ($, on) => {
+test('an unlabelled account shows no badge with showEmail off', { options: { ...LABELS, showEmail: false } }, async ($, on) => {
   const w = world(on, {}, 0, { HOME: '/Users/t' })
   w.files['/Users/t/.claude.json'] = account('you@example.org', 'Acme')
   await job($, w, 'go', 0.01)
@@ -1985,7 +1989,7 @@ const busy = async ($: Engine, w: World, spend = SPEND(1240, 10000)) => {
 }
 
 for (const cols of [100, 60]) {
-  test(`the band is three lines at ${cols} columns, the status line and the meters fitting`, { options: { ...LABELS, showName: true } }, async ($, on) => {
+  test(`the band is three lines at ${cols} columns, the status line and the meters fitting`, { options: { ...LABELS, showEmail: false } }, async ($, on) => {
     const w = world(on, {}, 0, { HOME: '/Users/t' })
     w.files['/Users/t/.claude.json'] = account('you@work.example.com')
     await busy($, w)
@@ -2105,9 +2109,11 @@ const drawnAsOpened = async ($: Engine, w: World) => {
 }
 
 // /radar opened before the first prompt: that prompt names the session and brings the Context
-// meter; the panel takes both at once, and after the job it is exactly as tall as it draws
-for (const showName of [true, false]) {
-  test(`an open panel takes the first prompt's rows${showName ? ', the name row too' : ''}`, { options: { showName } }, async ($, on) => {
+// meter; the panel takes both at once, then the first request's line, and after the job it is
+// exactly as tall as it draws (the name is shown by default, so this is the usual first session)
+for (const [kind, options] of [['by default', {}], ['showName on', { showName: true }], ['showName off', { showName: false }]] as const) {
+  const showName = (options as { showName?: boolean }).showName !== false
+  test(`an open panel takes the first prompt's rows${showName ? ', the name row too' : ''} (${kind})`, { options: options as never }, async ($, on) => {
     const w = world(on)
     await begin($, w)
     await radar($)
@@ -2119,11 +2125,15 @@ for (const showName of [true, false]) {
     let ui: any = await pane($)
     expect(w.opened.at(-1)).toBeGreaterThanOrEqual(height(await ui.drawn()))
     await ui.unmount()
+    if (showName) await shows(pane($), exactly('DEMO-7'))
+    else await hidden(pane($), /DEMO-7/)
     await start($, 'm')
     w.cost = 0.01
     await step($, w, 'm', 1000, 0)
+    // the first request brings its line: one more resize
+    expect(w.opened.length).toBe(opened + 2)
     await complete($, 'm')
-    expect(w.opened.length).toBe(opened + 1)
+    expect(w.opened.length).toBe(opened + 2)
     await drawnAsOpened($, w)
     if (showName) await shows(pane($), exactly('DEMO-7'))
     else await hidden(pane($), /DEMO-7/)
@@ -2141,7 +2151,7 @@ test('with showName, a later prompt naming the session grows an open panel by it
   await drawnAsOpened($, w)
 })
 
-test('without showName, a later prompt naming the session leaves an open panel as it is', async ($, on) => {
+test('with showName off, a later prompt naming the session leaves an open panel as it is', { options: { showName: false } }, async ($, on) => {
   const w = world(on)
   const { opened } = await openedUnnamed($, w)
   await prompt($, 'DEMO-7 tidy the docs')
@@ -2196,7 +2206,7 @@ const headerAt = async ($: Engine, cols: number, fitting = true) => {
 }
 
 for (const budget of [false, true]) {
-  test(`the band header drops tokens, the clock, then the model to fit${budget ? ', the budget cost staying' : ''}`, { options: { ...LABELS, showName: true } }, async ($, on) => {
+  test(`the band header drops tokens, the clock, then the model to fit${budget ? ', the budget cost staying' : ''}`, { options: { ...LABELS, showEmail: false } }, async ($, on) => {
     const w = world(on, {}, 0, { HOME: '/Users/t' })
     w.files['/Users/t/.claude.json'] = account('you@work.example.com')
     await job($, w, 'go', 0.03, 31_000)
@@ -2217,3 +2227,282 @@ for (const budget of [false, true]) {
     expect(await headerAt($, 20, !budget)).toBe(`◉ Usage Radar# 31k${cost}`)
   })
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.0: private mode and the defaults (the email and the name show unless turned off)
+// ════════════════════════════════════════════════════════════════════════════
+const HINT_TEXT = /^ ?\(\/radar private to hide\)$/
+// a work account in ~/.claude.json (a made-up address)
+const workWorld = (on: any, seed: Record<string, unknown> = {}, email = 'you@work.example.com') => {
+  const w = world(on, seed, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account(email)
+  return w
+}
+
+test('by default the band shows the email with a dim hint, then the name', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const ui = await band($, 160)
+  const badge = await ui.find({ type: 'Text', text: exactly('[WORK] you@work.example.com') })
+  expect(badge?.props.color).toBe('warning')
+  const hint = await ui.find({ type: 'Text', text: HINT_TEXT })
+  expect(hint?.props.dimColor).toBe(true)
+  await ui.unmount()
+  const [header] = await bandLines($, 160)
+  expect(textOf(header)).toMatch(/⏱ 0:00\[WORK\] you@work\.example\.com \(\/radar private to hide\)DEMO-142$/)
+  expect(columns(header)).toBeLessThanOrEqual(156)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  await fits($, w)
+})
+
+test('by default an unlabelled account shows its email and the hint in the panel', { options: { accounts: ['work.example.com=WORK'] } }, async ($, on) => {
+  const w = workWorld(on, {}, 'you@gmail.com')
+  await job($, w, 'go', 0.01)
+  await shows(pane($), exactly('you@gmail.com'), HINT_TEXT)
+  await fits($, w)
+})
+
+test('/radar private hides the email, the name and the hint everywhere, and remembers it', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  expect((await radarCmd($, 'private')).text).toBe('Private mode on: email and session name hidden.')
+  const [header] = await bandLines($, 160)
+  expect(textOf(header)).toMatch(/\[WORK\]$/)
+  await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+  await hidden(pane($), /@/, /DEMO-142/, /radar private/)
+  await shows(pane($), exactly('[WORK]'))
+  await fits($, w)
+  // the name is still kept, so it comes back
+  expect(record(w)?.name).toBe('DEMO-142')
+  expect(w.store.get('private')).toBe(true)
+})
+
+test('/radar private off shows the email, the name and the hint again', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  expect((await radarCmd($, 'private off')).text).toBe('Private mode off: email and session name shown.')
+  await shows(band($, 160), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  await shows(pane($), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  expect(w.store.get('private')).toBe(false)
+  await fits($, w)
+})
+
+for (const args of ['private on', 'PRIVATE', 'Private  ON']) {
+  test(`/radar ${args} turns private mode on`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    expect((await radarCmd($, args)).text).toBe('Private mode on: email and session name hidden.')
+    expect(w.store.get('private')).toBe(true)
+    await hidden(pane($), /@/, /DEMO-142/)
+  })
+}
+
+test('/radar private resizes an open panel by the name row, only when it changes', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  const rows = w.opened.at(-1) ?? 0
+  await radarCmd($, 'private')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows - 1)
+  await drawnAsOpened($, w)
+  // already on: no resize
+  await radarCmd($, 'private')
+  expect(w.opened.length).toBe(opened + 1)
+  await radarCmd($, 'private off')
+  expect(w.opened.length).toBe(opened + 2)
+  expect(w.opened.at(-1)).toBe(rows)
+  await drawnAsOpened($, w)
+})
+
+test('/radar private takes the badge row of an unlabelled account too', { options: { accounts: ['work.example.com=WORK'] } }, async ($, on) => {
+  const w = workWorld(on, {}, 'you@gmail.com')
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radar($)
+  const rows = w.opened.at(-1) ?? 0
+  await radarCmd($, 'private')
+  expect(w.opened.at(-1)).toBe(rows - 2)
+  await drawnAsOpened($, w)
+  await hidden(pane($), /@/, /DEMO-142/)
+})
+
+test('/radar private with the panel closed opens nothing', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  expect(w.opened.length).toBe(0)
+})
+
+test('private mode stays on in a new process and a new session', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: true })
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  // /clear: a new session id keeps it
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'DEMO-7 another thing', 0.01)
+  await hidden(pane($), /@/, /DEMO-7/)
+  expect(record(w)?.name).toBe('DEMO-7')
+})
+
+test('a stored private value that is not true counts as off', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: 'yes' })
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+})
+
+test('private mode set in one session carries to the next', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'DEMO-7 another thing', 0.01)
+  await hidden(band($, 160), /@/, /DEMO-7/)
+  await hidden(pane($), /@/, /DEMO-7/)
+})
+
+test('the store only keeps sessions and the private boolean, never the email', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  const all = JSON.stringify([...w.store.entries()])
+  expect(all).not.toContain('work.example.com')
+  expect(all).not.toContain('@')
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private')).toBe(true)
+  expect(w.store.get('private')).toBe(false)
+})
+
+test('showEmail and showName off: just the label, no hint, no name, before and after private mode', { options: { ...LABELS, showEmail: false, showName: false } }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const check = async () => {
+    const [header] = await bandLines($, 160)
+    expect(textOf(header)).toMatch(/\[WORK\]$/)
+    await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+    await hidden(pane($), /@/, /DEMO-142/, /radar private/)
+    await shows(pane($), exactly('[WORK]'))
+  }
+  await check()
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  await check()
+  await fits($, w)
+})
+
+test('/radar private with anything else after it: a usage reply, nothing changes', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  expect((await radarCmd($, 'private maybe')).text).toBe('Usage Radar: use /radar private or /radar private off')
+  expect(w.store.has('private')).toBe(false)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+})
+
+// The hint goes whole, before the name and the badge; never cut
+for (const cols of [100, 120, 160]) {
+  test(`the band header at ${cols} columns: the badge first, then the name, then the hint, never cut`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    const lines = await bandLines($, cols)
+    expect(lines.length).toBe(3)
+    const text = textOf(lines[0])
+    expect(columns(lines[0])).toBeLessThanOrEqual(cols - 4)
+    expect(text).not.toMatch(/…/)
+    expect(text).toMatch(/\[WORK\] you@work\.example\.com/)
+    if (cols === 100) expect(text).toMatch(/\[WORK\] you@work\.example\.com$/)
+    if (cols === 120) expect(text).toMatch(/\[WORK\] you@work\.example\.comDEMO-142$/)
+    if (cols === 160) expect(text).toMatch(/\(\/radar private to hide\)DEMO-142$/)
+    if (cols !== 160) expect(text).not.toMatch(/\(\/radar|private/)
+  })
+}
+
+test('a panel too narrow for the hint keeps the whole badge, without the hint', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, {}, 'firstname.lastname@work.example.com')
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] firstname.lastname@work.example.com'))
+  await hidden(pane($), /radar private/, /…/)
+  await fits($, w)
+})
+
+test('/radar private never names the session', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await prompt($, '/radar private', { name: 'radar', args: 'private' })
+  await radarCmd($, 'private')
+  expect(record(w)?.name ?? null).toBeNull()
+  await prompt($, '/radar private off', { name: 'radar', args: 'private off' })
+  await radarCmd($, 'private off')
+  await job($, w, 'DEMO-9 the real work', 0.01)
+  expect(record(w)?.name).toBe('DEMO-9')
+  await shows(pane($), exactly('DEMO-9'))
+})
+
+test('a mounted band redraws after /radar private', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const ui = await band($, 160)
+  expect(await ui.find({ type: 'Text', text: /@/ })).toBeDefined()
+  await radarCmd($, 'private')
+  expect(await ui.find({ type: 'Text', text: /@/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /DEMO-142/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+// The band header at 60 columns: "tokens", then the clock go; the cost always stays
+for (const budget of [false, true]) {
+  test(`the band header fits 60 columns${budget ? ' with a budget' : ''}: the cost stays`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'go', 0.03, 31_000)
+    if (budget) await radarCmd($, 'budget 7')
+    const text = await headerAt($, 60)
+    expect(text).toBe(budget ? '◉ Usage Radar✳ Opus 5.5# 31k≈$0.03 / $7.00' : '◉ Usage Radar✳ Opus 5.5# 31k≈$0.03⏱ 0:00')
+  })
+}
+
+// The last request: none until the session's first model request, then always
+test('the last request line waits for the first request', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await radar($)
+  await hidden(pane($), /last request/)
+  await prompt($, 'go')
+  await start($, 'm')
+  await hidden(band($), /last request/)
+  await hidden(pane($), /last request/)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  w.cost = 0.20
+  await step($, w, 'm', 10_000, 1_000)
+  expect(w.opened.length).toBe(opened + 1)
+  await shows(band($), /last request ≈\$0\.20 · 11k tokens/)
+  await shows(pane($), /^last request ≈\$0\.20 · 11k tokens/)
+  await drawnAsOpened($, w)
+  await complete($, 'm')
+  // the next prompt keeps it: the session has had a request
+  await prompt($, 'more')
+  await start($, 'm2')
+  await shows(pane($), /^last request/)
+  expect(w.opened.length).toBe(opened + 1)
+})
+
+test('a broken store: private mode starts off, and /radar private still hides the email on screen', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: true })
+  w.storeBroken = true
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  // the stored true can't be read: off
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+  expect((await radarCmd($, 'private')).text).toBe('Private mode on: email and session name hidden.')
+  await hidden(band($, 160), /@/, /DEMO-142/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  await shows(pane($), exactly('[WORK]'))
+})
