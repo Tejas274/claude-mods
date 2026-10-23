@@ -70,8 +70,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await band.find({ type: 'Text', text: /Opus 5\.5/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /196k/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /≈\$0\.34/ })).toBeDefined()
-    expect(await band.find({ type: 'Text', text: /this request: ≈\$0\.34 · 196k/ })).toBeDefined()
-    expect(await band.find({ type: 'Text', text: /1\/2 tasks  ·  Writing tests/ })).toBeDefined()
+    // the status line: the steps, the helper, the tasks; the last request is cut off here (see the pane)
+    expect(await band.find({ type: 'Text', text: /1 step  ·  1 of 1 helper working  ·  1\/2 tasks  ·  Writing tests/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /5h limit/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /83%/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /Context/ })).toBeDefined()
@@ -89,6 +89,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await pane.find({ type: 'Text', text: /1 running/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /resets in 2h 0m/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /Weekly/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^last request ≈\$0\.34 · 196k tokens · / })).toBeDefined()
     await pane.unmount()
 
     // the helper finishes: now the whole job is done
@@ -141,6 +142,8 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     fetchedAt: [] as number[],
     reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string },
     hold: null as null | Promise<void>,
+    /** the store fails every get and set */
+    storeBroken: false,
   }
   on('session.authorize', () => {
     w.authorized++
@@ -164,8 +167,12 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return (text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }) as never
   })
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }) as never)
-  on('store.get', (_$: any, e: any) => ({ value: w.store.get(e.key) }) as never)
+  on('store.get', (_$: any, e: any) => {
+    if (w.storeBroken) throw new Error('store down')
+    return { value: w.store.get(e.key) } as never
+  })
   on('store.set', (_$: any, e: any) => {
+    if (w.storeBroken) throw new Error('store down')
     w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined } as never
   })
@@ -308,8 +315,10 @@ test('three prompts add up to session totals', async ($, on) => {
   await complete($, 'm3')
 
   const totals = [/^≈\$0\.30$/, /^140k$/, /^0:10$/, /3 steps/]
-  await shows(pane($), ...totals, /Session total ≈\$0\.30/, /2 agents/, /this request: ≈\$0\.05 · 54k · 0:02 · 0 steps/)
-  await shows(band($), ...totals, /this request: ≈\$0\.05 · 54k · 0:02 · 0 steps/)
+  await shows(pane($), ...totals, /Session total ≈\$0\.30/, /2 agents/, /last request ≈\$0\.05 · 54k tokens · 0:02$/)
+  await shows(band($), ...totals, /last request ≈\$0\.05 · 54k tokens · 0:02$/)
+  await hidden(pane($), /0 steps/)
+  await hidden(band($), /0 steps/)
 })
 
 test('a new session id starts at zero, and the old one comes back', async ($, on) => {
@@ -340,7 +349,7 @@ test('a new session id starts at zero, and the old one comes back', async ($, on
 })
 
 for (const ledgerAtLoad of [0, 1]) {
-  test(`resume continues saved totals (ledger ${ledgerAtLoad} at load)`, async ($, on) => {
+  test(`resume continues saved totals (ledger ${ledgerAtLoad} at load)`, { options: { showName: true } }, async ($, on) => {
     const now = 400 * DAY
     const w = world(on, {
       'session:s1': {
@@ -361,7 +370,7 @@ for (const ledgerAtLoad of [0, 1]) {
     await complete($, 'h', 'old1')
     await complete($, 'm')
 
-    const totals = [/^≈\$1\.20$/, /^511k$/, /^10:05$/, /41 steps/, /^DEMO-142$/, /this request: ≈\$0\.20 · 11k · 0:05 · 1 step/]
+    const totals = [/^≈\$1\.20$/, /^511k$/, /^10:05$/, /41 steps/, /^DEMO-142$/, /last request ≈\$0\.20 · 11k tokens · 0:05/]
     await shows(pane($), ...totals, /Session total ≈\$1\.20/, /3 agents/)
     await shows(band($), ...totals)
   })
@@ -496,7 +505,7 @@ const NAMES: Array<[string, string, string]> = [
   ['upgrade ruby-3.2 and node-18.1 then vue-3.4', 'upgrade ruby-3.2 and node-18.1 then', 'words'],
 ]
 
-test('the first prompt names the session', async ($, on) => {
+test('the first prompt names the session', { options: { showName: true } }, async ($, on) => {
   const w = world(on)
   for (const [i, [text, name, kind]] of NAMES.entries()) {
     w.sid = `k${i}`
@@ -510,7 +519,7 @@ test('the first prompt names the session', async ($, on) => {
   }
 })
 
-test('slash commands: built-ins give no name, your own do', async ($, on) => {
+test('slash commands: built-ins give no name, your own do', { options: { showName: true } }, async ($, on) => {
   const w = world(on)
   await prompt($, '/model sonnet', { name: 'model', args: 'sonnet' })
   expect(record(w)).toBeUndefined()
@@ -527,7 +536,7 @@ test('slash commands: built-ins give no name, your own do', async ($, on) => {
   expect(record(w)?.name).toBe('add dark mode')
 })
 
-test('/rename and the session title win over the automatic name', async ($, on) => {
+test('/rename and the session title win over the automatic name', { options: { showName: true } }, async ($, on) => {
   const w = world(on)
   await job($, w, 'fix stuff quickly', 0.01)
   expect(record(w)).toMatchObject({ name: 'fix stuff quickly', nameKind: 'words' })
@@ -548,16 +557,18 @@ test('/rename and the session title win over the automatic name', async ($, on) 
   await shows(pane($), /^Billing fix$/)
 })
 
-test('a long name is cut to fit a narrow band', async ($, on) => {
+test('a long name is cut to fit the band header, and left out when there is no room', { options: { showName: true } }, async ($, on) => {
   const w = world(on)
   await job($, w, 'hello', 0.01)
   await rename($, 'A'.repeat(60))
-  const ui = await band($, 40)
+  const ui = await band($, 100)
   const names = (await ui.findAll({ type: 'Text', text: /^A+/ })).filter(t => t.props.bold)
   expect(names.length).toBe(1)
-  expect(names[0]?.text.length ?? 99).toBeLessThanOrEqual(13)
+  expect(names[0]?.text.length ?? 99).toBeLessThanOrEqual(28)
   expect(names[0]?.text).toEndWith('…')
   await ui.unmount()
+  // 40 columns: the header has no room left for it
+  await hidden(band($, 40), /^A+/)
 })
 
 test('the main row shows session totals, without cache reads or helpers', async ($, on) => {
@@ -762,7 +773,7 @@ test('resume brings the session\'s agents back; another session has none', async
   expect(record(w)?.agents).toEqual([])
 })
 
-test('a 2.1.0 record without agents still loads', async ($, on) => {
+test('a 2.1.0 record without agents still loads', { options: { showName: true } }, async ($, on) => {
   const now = 400 * DAY
   const w = world(on, {
     'session:s1': {
@@ -849,7 +860,7 @@ test('a ledger reading that arrives late is not counted again', async ($, on) =>
   }
   await w.clock.advance(1_000)
   expect(w.onList).toBeNull()
-  await shows(pane($), /^≈\$0\.20$/, /Session total ≈\$0\.20/, /this request: ≈\$0\.20/)
+  await shows(pane($), /^≈\$0\.20$/, /Session total ≈\$0\.20/, /last request ≈\$0\.20/)
 
   // the poll's own reading is $0.20 but a step to $0.30 lands first: the late $0.20 is left out
   w.onUsage = async () => {
@@ -858,7 +869,7 @@ test('a ledger reading that arrives late is not counted again', async ($, on) =>
   }
   await w.clock.advance(1_000)
   expect(w.onUsage).toBeNull()
-  await shows(pane($), /^≈\$0\.30$/, /Session total ≈\$0\.30/, /this request: ≈\$0\.30/)
+  await shows(pane($), /^≈\$0\.30$/, /Session total ≈\$0\.30/, /last request ≈\$0\.30/)
   await w.clock.advance(1_000)
   await complete($, 'm')
   await shows(pane($), /^≈\$0\.30$/)
@@ -1196,17 +1207,21 @@ const LABELS = { accounts: ['work.example.com=WORK', 'gmail.com=PERSONAL'] }
 const account = (email: string | null, org: string | null = null) =>
   JSON.stringify({ oauthAccount: { ...(email && { emailAddress: email }), ...(org && { organizationName: org }) } })
 
-test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge', { options: LABELS }, async ($, on) => {
+test('a work account from $CLAUDE_CONFIG_DIR gets an amber [WORK] badge (showEmail off)', { options: { ...LABELS, showEmail: false } }, async ($, on) => {
   const w = world(on, {}, 0, { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work', HOME: '/Users/t' })
   w.files['/Users/t/.claude-work/.claude.json'] = account('you@work.example.com', 'Work Co')
   w.files['/Users/t/.claude.json'] = account('you@gmail.com')
   await job($, w, 'go', 0.01)
-  await shows(band($), exactly('[WORK] you@work.example.com'))
-  await shows(pane($), exactly('[WORK] you@work.example.com'))
-  expect(await color(band($), exactly('[WORK] you@work.example.com'))).toBe('warning')
-  expect(await color(pane($), exactly('[WORK] you@work.example.com'))).toBe('warning')
+  await shows(band($), exactly('[WORK]'))
+  await shows(pane($), exactly('[WORK]'))
+  expect(await color(band($), exactly('[WORK]'))).toBe('warning')
+  expect(await color(pane($), exactly('[WORK]'))).toBe('warning')
+  // showEmail off hides the email
+  await hidden(band($), /@/)
+  await hidden(pane($), /@/)
 })
 
+// by default the email shows next to the label
 for (const [email, badge, colour] of [
   ['you@gmail.com', '[PERSONAL] you@gmail.com', 'success'],
   ['You@Mail.Work.Example.COM', '[WORK] You@Mail.Work.Example.COM', 'warning'],
@@ -1220,17 +1235,27 @@ for (const [email, badge, colour] of [
   })
 }
 
-const BADGES: Array<[string, Record<string, unknown>, string, string]> = [
-  ['no label: the email, dim', { accounts: ['work.example.com=WORK'] }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
-  ['hideEmail with a label', { ...LABELS, hideEmail: true }, account('you@work.example.com', 'Work Co'), '[WORK]'],
-  ['hideEmail without a label: the organization', { hideEmail: true }, account('you@gmail.com', 'Acme'), 'Acme'],
-  ['a custom label: orange', { accounts: 'gmail.com=Side; work.example.com=WORK' }, account('you@gmail.com'), '[Side] you@gmail.com'],
+const BADGES: Array<[string, Record<string, unknown>, string, string | null]> = [
+  ['no label, by default: the email, dim', { accounts: ['work.example.com=WORK'] }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
+  ['no label, showEmail off: no badge', { accounts: ['work.example.com=WORK'], showEmail: false }, account('you@gmail.com', 'Acme'), null],
+  ['no label, showEmail on: the email, dim', { accounts: ['work.example.com=WORK'], showEmail: true }, account('you@gmail.com', 'Acme'), 'you@gmail.com'],
+  ['a label, by default: the label and the email', LABELS, account('you@work.example.com', 'Work Co'), '[WORK] you@work.example.com'],
+  ['a label, showEmail off: just the label', { ...LABELS, showEmail: false }, account('you@work.example.com', 'Work Co'), '[WORK]'],
+  ['no label and no email: no badge', LABELS, account(null, 'Acme'), null],
+  ['no label and no email, showEmail on: still no badge, never the organization', { ...LABELS, showEmail: true }, account(null, 'Acme'), null],
+  ['a custom label, showEmail off: orange', { accounts: 'gmail.com=Side; work.example.com=WORK', showEmail: false }, account('you@gmail.com'), '[Side]'],
+  ['a custom label, by default', { accounts: 'gmail.com=Side' }, account('you@gmail.com'), '[Side] you@gmail.com'],
 ]
 for (const [label, options, file, badge] of BADGES) {
   test(`account badge: ${label}`, { options: options as never }, async ($, on) => {
     const w = world(on, {}, 0, { HOME: '/Users/t' })
     w.files['/Users/t/.claude.json'] = file
     await job($, w, 'go', 0.01)
+    if (badge === null) {
+      await hidden(band($), /@|Acme|WORK|claude/)
+      await hidden(pane($), /@|Acme|WORK|claude/)
+      return await fits($, w)
+    }
     await shows(band($), exactly(badge))
     await shows(pane($), exactly(badge))
     const ui = await band($)
@@ -1241,22 +1266,28 @@ for (const [label, options, file, badge] of BADGES) {
   })
 }
 
-const FALLBACKS: Array<[string, Record<string, string>, Record<string, string>, string]> = [
-  ['an organization only', { HOME: '/Users/t' }, { '/Users/t/.claude.json': account(null, 'Acme') }, 'Acme'],
-  ['no file under $CLAUDE_CONFIG_DIR', { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work/', HOME: '/Users/t' }, {}, '~/.claude-work'],
-  ['a broken file', { HOME: '/Users/t' }, { '/Users/t/.claude.json': '{ not json' }, '~/.claude'],
-  ['no environment', {}, {}, '~/.claude'],
-  ['a config dir outside home', { CLAUDE_CONFIG_DIR: '/opt/cc/conf', HOME: '/Users/t' }, {}, 'conf'],
+// No email to show: no badge, never the organization or the config dir (they can name the company)
+const FALLBACKS: Array<[string, Record<string, string>, Record<string, string>]> = [
+  ['an organization only', { HOME: '/Users/t' }, { '/Users/t/.claude.json': account(null, 'Acme') }],
+  ['no file under $CLAUDE_CONFIG_DIR', { CLAUDE_CONFIG_DIR: '/Users/t/.claude-work/', HOME: '/Users/t' }, {}],
+  ['a broken file', { HOME: '/Users/t' }, { '/Users/t/.claude.json': '{ not json' }],
+  ['no environment', {}, {}],
+  ['a config dir outside home', { CLAUDE_CONFIG_DIR: '/opt/cc/conf', HOME: '/Users/t' }, {}],
 ]
-for (const [label, env, files, badge] of FALLBACKS) {
-  test(`account badge falls back: ${label}`, { options: LABELS }, async ($, on) => {
-    const w = world(on, {}, 0, env)
-    Object.assign(w.files, files)
-    await job($, w, 'go', 0.01)
-    await shows(band($), exactly(badge), /^≈\$0\.01$/)
-    await shows(pane($), exactly(badge), /Session total ≈\$0\.01/)
-    expect(record(w)).toMatchObject({ cost: 0.01 })
-  })
+for (const [label, env, files] of FALLBACKS) {
+  for (const [kind, options] of [['by default', LABELS], ['showEmail on', { ...LABELS, showEmail: true }]] as const) {
+    test(`no badge without an email (${kind}): ${label}`, { options: options as never }, async ($, on) => {
+      const w = world(on, {}, 0, env)
+      Object.assign(w.files, files)
+      await job($, w, 'go', 0.01)
+      await shows(band($), /^≈\$0\.01$/)
+      await shows(pane($), /Session total ≈\$0\.01/)
+      await hidden(band($), /Acme|claude|conf|\[|radar private/)
+      await hidden(pane($), /Acme|claude|conf|\[|radar private/)
+      expect(record(w)).toMatchObject({ cost: 0.01 })
+      await fits($, w)
+    })
+  }
 }
 
 test('the account file is read once, and the account is never saved', { options: LABELS }, async ($, on) => {
@@ -1282,11 +1313,13 @@ test('showAccount off hides the badge everywhere', { options: { ...LABELS, showA
 })
 
 for (const showAccount of [true, false]) {
-  test(`the panel fits with the badge, a budget bar and limits (showAccount ${showAccount})`, { options: { ...LABELS, showAccount } }, async ($, on) => {
+  test(`the panel fits with the badge, the name, a budget bar, the spend limit and limits (showAccount ${showAccount})`, { options: { ...LABELS, showAccount, showName: true } }, async ($, on) => {
     const w = world(on, {}, 0, { HOME: '/Users/t' })
     w.files['/Users/t/.claude.json'] = account('you@gmail.com')
     w.limits = [five(30), { kind: 'seven_day', percentUsed: 11 }]
     w.agents = [{ id: 'a1', description: '', type: 'coder', status: 'running' }]
+    spendOn(w, SPEND(1240, 10000))
+    await begin($, w)
     await prompt($, 'go')
     await start($, 'm')
     w.cost = 0.10
@@ -1407,13 +1440,14 @@ const labels = async ($: Engine) => {
 
 test('the dollar spend limit comes first, with no reset time of its own', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /^Spend/, /\$88\.40 used · \$11\.60 left of \$100/, /88%/)
+  await shows(pane($), /^Spend  \$87\.60 left$/, /^\$12\.40 of \$100 used$/, /^12%$/)
   await hidden(pane($), /resets in/)
-  await shows(band($), /^Spend $/, /88%/)
-  await hidden(band($), /\$88/)
+  // the band: what's left, not what's used
+  await shows(band($), /^Spend $/, /^\$87\.60$/, /^ left $/, /^12%$/)
+  await hidden(band($), /\$12\.40/, /\$100/)
   expect(w.fetches[0].url).toBe(SPEND_URL)
   expect(w.fetches[0].init.auth).toBe('h')
   expect(w.fetches[0].init.headers['anthropic-beta']).toBe('oauth-2025-04-20')
@@ -1422,7 +1456,7 @@ test('the dollar spend limit comes first, with no reset time of its own', async 
 test('Spend comes before the 5h limit, Weekly and Context', async ($, on) => {
   const w = world(on)
   w.limits = [five(30), seven(11)]
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   expect(await labels($)).toEqual(['Spend', '5h limit', 'Weekly', 'Context'])
@@ -1431,14 +1465,14 @@ test('Spend comes before the 5h limit, Weekly and Context', async ($, on) => {
 test('the dollars and Claude Code\'s own spend_limit are one Spend row, with its reset', async ($, on) => {
   const w = world(on)
   const resetsAt = new Date((8 * 24 + 14) * 3600_000 + 10 * 60_000).toISOString()
-  w.limits = [{ kind: 'spend_limit', percentUsed: 87, resetsAt }]
-  spendOn(w, SPEND(8840, 10000))
+  w.limits = [{ kind: 'spend_limit', percentUsed: 11, resetsAt }]
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   const ui = await pane($)
   expect((await ui.findAll({ type: 'Text', text: /^Spend/ })).length).toBe(1)
   await ui.unmount()
-  await shows(pane($), /\$88\.40 used/, /88%/, /resets in 8d 14h/)
+  await shows(pane($), /\$12\.40 of \$100 used/, /^12%$/, /resets in 8d 14h/)
   // 96%: from the next check, and Claude Code's own reading after it: one ⛔
   spendOn(w, SPEND(9600, 10000))
   await w.clock.advance(60_000)
@@ -1450,7 +1484,7 @@ test('the dollars and Claude Code\'s own spend_limit are one Spend row, with its
 test('without Claude Code\'s spend_limit, the Spend row has no reset time', async ($, on) => {
   const w = world(on)
   w.limits = [seven(11)]
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   await shows(pane($), /^Spend/, /^Weekly/)
@@ -1486,7 +1520,7 @@ for (const [label, set, requests] of NO_SPEND) {
     if (requests === 0) expect(w.fetches.length).toBe(0)
     else expect(w.fetches.length).toBeGreaterThan(0)
     await shows(pane($), /^5h limit/, /^Weekly/)
-    await hidden(pane($), /^Spend/, /left of/)
+    await hidden(pane($), /^Spend/, /of .* used$/, exactly('Left'))
     await fits($, w)
   })
 }
@@ -1496,56 +1530,59 @@ test('an account without a spend limit but with extra usage reads it from extra_
   spendOn(w, { spend: null, extra_usage: { is_enabled: true, monthly_limit: 20000, used_credits: 12000, decimal_places: 2, currency: 'USD' } })
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$120 used · \$80 left of \$200/, /^60%$/)
+  await shows(pane($), /^Spend  \$80 left$/, /^\$120 of \$200 used$/, /^60%$/)
 })
 
 test('over the limit: how much over, and ⛔', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(10270, 10000))
+  spendOn(w, SPEND(10350, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$102\.70 used · \$2\.70 over \$100/, /^103% ⛔$/)
+  await shows(pane($), /^Spend  \$3\.50 over$/, /^\$103\.50 of \$100 used$/, /^⛔ 103%$/, exactly('Over'), exactly('$3.50'))
+  await hidden(pane($), exactly('Left'))
+  await shows(band($), /^\$3\.50$/, /^ over $/, /^⛔ 103%$/)
+  expect(await color(pane($), exactly('$3.50'))).toBe('error')
 })
 
 test('a failed check keeps the last reading; the third in a row drops it', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   const toasts = w.toasts.length
   w.reply = { status: 500, ok: false, text: '' }
   await w.clock.advance(60_000)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   await w.clock.advance(60_000)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   // a good answer in between starts the count over
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await w.clock.advance(60_000)
   w.reply = { status: 500, ok: false, text: '' }
   await w.clock.advance(60_000)
   await w.clock.advance(60_000)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   // the third failure in a row
   await w.clock.advance(60_000)
-  await hidden(pane($), /^Spend/, /\$88\.40/)
+  await hidden(pane($), /^Spend/, /\$12\.40/)
   expect(w.toasts.length).toBe(toasts)
 })
 
 test('an answer without a spend limit drops the last reading at once', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   spendOn(w, { spend: null, extra_usage: null })
   await w.clock.advance(60_000)
-  await hidden(pane($), /^Spend/, /\$88\.40/)
+  await hidden(pane($), /^Spend/, /\$12\.40/)
 })
 
 test('the spend limit is read once a minute, also while idle', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   expect(w.fetches.length).toBe(1)
   await prompt($, 'go')
@@ -1562,7 +1599,7 @@ test('the spend limit is read once a minute, also while idle', async ($, on) => 
 
 test('an event check off the minute grid moves the next one: never two within a minute', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await w.clock.advance(60_000)
   expect(w.fetches.length).toBe(2)
@@ -1585,7 +1622,7 @@ test('an event check off the minute grid moves the next one: never two within a 
 
 test('a busy session still checks about once a minute, never twice within 55 s', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await prompt($, 'go')
   await start($, 'm')
@@ -1602,7 +1639,7 @@ test('a busy session still checks about once a minute, never twice within 55 s',
 
 test('a tick a few seconds early after an off-grid check still checks every minute', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   w.surfaces = []
   await begin($, w)
   // the first check happens 3 s in, so each tick lands 3 s "early" against it
@@ -1619,7 +1656,7 @@ test('a tick a few seconds early after an off-grid check still checks every minu
 
 test('a check that never answers stops holding the next one back after 5 minutes', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   w.hold = new Promise(() => {})
   await begin($, w)
   w.hold = null
@@ -1627,30 +1664,30 @@ test('a check that never answers stops holding the next one back after 5 minutes
   expect(w.fetches.length).toBe(1)
   await w.clock.advance(60_000)
   expect(w.fetches.length).toBe(2)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
 })
 
 test('a late answer of an older check does not overwrite a newer reading', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   let land = () => {}
   w.hold = new Promise(r => { land = r })
   await begin($, w)
   w.hold = null
-  // 5 minutes on, a new check reads $20
-  spendOn(w, SPEND(2000, 10000))
+  // 5 minutes on, a new check reads $50
+  spendOn(w, SPEND(5000, 10000))
   await w.clock.advance(300_000)
-  await shows(pane($), /\$20 used/)
-  // the stuck one's $88.40 lands now: dropped
+  await shows(pane($), /\$50 of \$100 used/)
+  // the stuck one's $12.40 lands now: dropped
   land()
   await w.clock.advance(0)
-  await shows(pane($), /\$20 used/)
-  await hidden(pane($), /\$88\.40/)
+  await shows(pane($), /\$50 of \$100 used/)
+  await hidden(pane($), /\$12\.40/)
 })
 
 test('a -p run makes no request', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   w.surfaces = []
   await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
   await job($, w, 'go', 0.01)
@@ -1662,7 +1699,7 @@ test('a -p run makes no request', async ($, on) => {
 
 test('an SDK session reads the spend limit once a client attaches', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   w.surfaces = []
   await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
   await job($, w, 'go', 0.01)
@@ -1672,7 +1709,7 @@ test('an SDK session reads the spend limit once a client attaches', async ($, on
   w.surfaces = ['desktop']
   await w.clock.advance(60_000)
   expect(w.fetches.length).toBe(1)
-  await shows(pane($), /\$88\.40 used/)
+  await shows(pane($), /\$12\.40 of \$100 used/)
 })
 
 test('another currency and exponent', async ($, on) => {
@@ -1680,21 +1717,22 @@ test('another currency and exponent', async ($, on) => {
   spendOn(w, {
     spend: {
       enabled: true,
-      used: { amount_minor: 88, exponent: 0, currency: 'EUR' },
+      used: { amount_minor: 84, exponent: 0, currency: 'EUR' },
       limit: { amount_minor: 100, exponent: 0, currency: 'EUR' },
     },
     extra_usage: null,
   })
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /88 EUR used · 12 EUR left of 100 EUR/, /^88% ⚠$/)
+  await shows(pane($), /^Spend  16 EUR left$/, /^84 EUR of 100 EUR used$/, /^⚠ 84%$/, exactly('Left'), exactly('16 EUR'))
+  await shows(band($), /^16 EUR$/, /^⚠ 84%$/)
 })
 
 test('the Spend row with a forecast still fits on one line', { timeoutMs: 30_000 }, async ($, on) => {
   const w = world(on)
   const engine = (pct: number) => ({ kind: 'spend_limit', percentUsed: pct, resetsAt: new Date(3 * 3600_000).toISOString() })
   w.limits = [engine(40)]
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(8420, 10000))
   await begin($, w)
   await prompt($, 'go')
   await start($, 'm')
@@ -1702,9 +1740,9 @@ test('the Spend row with a forecast still fits on one line', { timeoutMs: 30_000
   await w.clock.advance(10_000)
   const ui = await pane($)
   const line = await ui.find({ type: 'Text', text: /^Spend/ })
-  const level = await ui.find({ type: 'Text', text: /^88% ⚠$/ })
+  const level = await ui.find({ type: 'Text', text: /^⚠ 84%$/ })
   expect(line?.text).toMatch(/at this pace$/)
-  expect(line?.text).toMatch(/\$88/)
+  expect(line?.text).toMatch(/^Spend  \$15\.80 left · /)
   // the pane's width: bodyColumns 60 - 2; the label side and the percent side, one space apart
   expect((line?.text.length ?? 99) + 1 + (level?.text.length ?? 99)).toBeLessThanOrEqual(58)
   await ui.unmount()
@@ -1712,7 +1750,7 @@ test('the Spend row with a forecast still fits on one line', { timeoutMs: 30_000
 
 test('an open panel shrinks when the Spend row goes', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   await radar($)
@@ -1727,7 +1765,7 @@ test('an open panel shrinks when the Spend row goes', async ($, on) => {
 
 test('the end of the session stops the checks', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   const fetches = w.fetches.length
   await $.session.end({ sessionId: 's1', reason: 'other' } as never)
@@ -1737,13 +1775,13 @@ test('the end of the session stops the checks', async ($, on) => {
 
 test('showSpend off: no request at all', { options: { showSpend: false } }, async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   await w.clock.advance(120_000)
   expect(w.authorized).toBe(0)
   expect(w.fetches.length).toBe(0)
-  await hidden(pane($), /left of/)
+  await hidden(pane($), /^Spend/, /of .* used$/, exactly('Left'))
 })
 
 test('a personal account: no Spend row, the 5h and weekly limits as before', async ($, on) => {
@@ -1768,7 +1806,7 @@ test('an open panel grows when the Spend row first appears', async ($, on) => {
   await job($, w, 'go', 0.01)
   await radar($)
   const opened = w.opened.length
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await w.clock.advance(60_000)
   expect(w.opened.length).toBe(opened + 1)
   const ui: any = await pane($)
@@ -1778,12 +1816,12 @@ test('an open panel grows when the Spend row first appears', async ($, on) => {
 
 test('the dollars are never saved', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   const saved = JSON.stringify([...w.store.entries()])
-  expect(saved).not.toContain('88.4')
+  expect(saved).not.toContain('12.4')
   expect(saved).not.toContain('spend')
 })
 
@@ -1802,14 +1840,14 @@ test('Spend past 80% warns once', async ($, on) => {
 for (const [label, auth] of [['no claude login', null], ['an API key', { handle: 'k', kind: 'api-key' }]] as const) {
   test(`switching to ${label} drops the Spend row at the next check`, async ($, on) => {
     const w = world(on)
-    spendOn(w, SPEND(8840, 10000))
+    spendOn(w, SPEND(1240, 10000))
     await begin($, w)
     await job($, w, 'go', 0.01)
-    await shows(pane($), /\$88\.40/)
+    await shows(pane($), /\$12\.40/)
     const toasts = w.toasts.length
     w.auth = auth
     await w.clock.advance(60_000)
-    await hidden(pane($), /^Spend/, /\$88\.40/)
+    await hidden(pane($), /^Spend/, /\$12\.40/)
     expect(w.toasts.length).toBe(toasts)
   })
 }
@@ -1817,58 +1855,654 @@ for (const [label, auth] of [['no claude login', null], ['an API key', { handle:
 test('another account drops the old dollars before the new ones come', async ($, on) => {
   const w = world(on, {}, 0, { HOME: '/Users/t' })
   w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   // /login as someone else; the next check's answer is slow
   w.files['/Users/t/.claude.json'] = account('me@gmail.com')
-  spendOn(w, SPEND(2000, 10000))
+  spendOn(w, SPEND(5000, 10000))
   let land = () => {}
   w.hold = new Promise(r => { land = r })
   await w.clock.advance(60_000)
   w.hold = null
-  await hidden(pane($), /^Spend/, /\$88\.40/)
+  await hidden(pane($), /^Spend/, /\$12\.40/)
   land()
   await w.clock.advance(0)
-  await shows(pane($), /\$20 used/)
+  await shows(pane($), /\$50 of \$100 used/)
 })
 
 test('an answer on its way when the account changes is dropped', async ($, on) => {
   const w = world(on, {}, 0, { HOME: '/Users/t' })
   w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
-  await shows(pane($), /\$88\.40/)
-  // a check under the old account, slow; the old account's answer would be $40
-  spendOn(w, SPEND(4000, 10000))
+  await shows(pane($), /\$12\.40/)
+  // a check under the old account, slow; the old account's answer would be $30
+  spendOn(w, SPEND(3000, 10000))
   let land = () => {}
   w.hold = new Promise(r => { land = r })
   await w.clock.advance(60_000)
   w.hold = null
   // meanwhile, /login as someone else
   w.files['/Users/t/.claude.json'] = account('me@gmail.com')
-  spendOn(w, SPEND(2000, 10000))
+  spendOn(w, SPEND(5000, 10000))
   land()
   await w.clock.advance(0)
-  await hidden(pane($), /^Spend/, /\$40/, /\$88\.40/)
+  await hidden(pane($), /^Spend/, /\$30 of/, /\$12\.40/)
   // the next tick reads the new account
   await w.clock.advance(60_000)
-  await shows(pane($), /\$20 used/)
+  await shows(pane($), /\$50 of \$100 used/)
 })
 
 test('asking for the login failing keeps the last reading like any failed check', async ($, on) => {
   const w = world(on)
-  spendOn(w, SPEND(8840, 10000))
+  spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   const toasts = w.toasts.length
   w.auth = 'throw'
   await w.clock.advance(60_000)
   await w.clock.advance(60_000)
-  await shows(pane($), /\$88\.40/)
+  await shows(pane($), /\$12\.40/)
   await w.clock.advance(60_000)
   await hidden(pane($), /^Spend/)
   expect(w.toasts.length).toBe(toasts)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.0: a three-line band, the name and email shown by default, the Left tile
+// ════════════════════════════════════════════════════════════════════════════
+// The text a drawn element shows, and how many columns it takes (a row: its children + gaps)
+const textOf = (el: any): string =>
+  typeof el === 'string' || typeof el === 'number' ? String(el) : (el?.children ?? []).map(textOf).join('')
+const columns = (el: any): number => {
+  if (el.type === 'Text') return textOf(el).length
+  const kids = (el.children ?? []).filter((c: any) => c && typeof c === 'object')
+  return el.props?.flexDirection === 'row'
+    ? kids.reduce((s: number, c: any) => s + columns(c), 0) + (el.props?.gap ?? 0) * Math.max(0, kids.length - 1)
+    : Math.max(0, ...kids.map(columns))
+}
+// The band's lines inside its border, as drawn
+const bandLines = async ($: Engine, bodyColumns: number): Promise<any[]> => {
+  const ui: any = await band($, bodyColumns)
+  const root = await ui.drawn()
+  await ui.unmount()
+  expect(height(root)).toBe((root.children ?? []).filter((c: any) => c && typeof c === 'object').length + 2)
+  return (root.children ?? []).filter((c: any) => c && typeof c === 'object')
+}
+
+test('showName off hides the name, in the band and the panel', { options: { ...LABELS, showName: false } }, async ($, on) => {
+  const w = world(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  expect(record(w)?.name).toBe('DEMO-142')
+  await hidden(band($), /DEMO-142/)
+  await hidden(pane($), /DEMO-142/)
+  await fits($, w)
+})
+
+test('by default the name shows in the band header and the panel', { options: LABELS }, async ($, on) => {
+  const w = world(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const [header] = await bandLines($, 100)
+  expect(textOf(header)).toMatch(/DEMO-142$/)
+  await shows(pane($), exactly('DEMO-142'))
+  await fits($, w)
+})
+
+test('showEmail off: the badge is just the label, on the band header line, and no email anywhere', { options: { ...LABELS, showEmail: false, showName: false } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com', 'Work Co')
+  await job($, w, 'go', 0.01)
+  const [header] = await bandLines($, 100)
+  expect(textOf(header)).toMatch(/^◉ Usage Radar.*\[WORK\]$/)
+  await hidden(band($), /@/)
+  await hidden(pane($), /@/)
+  await fits($, w)
+})
+
+test('an unlabelled account shows no badge with showEmail off', { options: { ...LABELS, showEmail: false } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@example.org', 'Acme')
+  await job($, w, 'go', 0.01)
+  await hidden(band($), /@|Acme|\[/)
+  await hidden(pane($), /@|Acme|\[/)
+  await fits($, w)
+})
+
+// Spend, the 5h limit, Weekly and Context, a to-do list and a helper
+const busy = async ($: Engine, w: World, spend = SPEND(1240, 10000)) => {
+  w.limits = [five(30), seven(11)]
+  w.agents = [{ id: 'a1', description: 'Explore codebase', type: 'Explore', status: 'running' }]
+  spendOn(w, spend)
+  await begin($, w)
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.20
+  await step($, w, 'm', 10_000, 1_000)
+  await start($, 'h', 'a1')
+  await $.tool.call({ tool: 'TodoWrite', todos: [
+    { content: 'A', status: 'completed', activeForm: 'Doing A' },
+    { content: 'B', status: 'in_progress', activeForm: 'Writing tests' },
+  ] } as never)
+}
+
+for (const cols of [100, 60]) {
+  test(`the band is three lines at ${cols} columns, the status line and the meters fitting`, { options: { ...LABELS, showEmail: false } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+    await busy($, w)
+    const lines = await bandLines($, cols)
+    expect(lines.length).toBe(3)
+    // the status line and the meters fit; no "N% context" bar line any more
+    expect(columns(lines[1])).toBeLessThanOrEqual(cols - 4)
+    expect(columns(lines[2])).toBeLessThanOrEqual(cols - 4)
+    expect(textOf(lines[2])).toMatch(/^Spend \$87\.60 left 12%/)
+    await hidden(band($, cols), /% context/)
+    // the header fits too; at 100 columns with the badge and the name
+    expect(columns(lines[0])).toBeLessThanOrEqual(cols - 4)
+    if (cols === 100) {
+      expect(textOf(lines[1])).toMatch(/1\/2 tasks/)
+      expect(columns(lines[0])).toBeLessThanOrEqual(96)
+      expect(textOf(lines[0])).toMatch(/\[WORK\]go$/)
+    }
+  })
+}
+
+test('the status line ends with the last request', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.20, 10_000, 1_000)
+  const lines = await bandLines($, 100)
+  expect(textOf(lines[1])).toMatch(/^✓ Done  ·  0 steps  ·  last request ≈\$0\.20 · 11k tokens · 0:00$/)
+})
+
+test('the band meters fit 60 columns: Spend and Context always stay, the rest as room allows', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await busy($, w)
+  // the 5h limit climbs for 3 minutes: it gets a forecast
+  let pct = 30
+  for (let s = 0; s < 180; s += 30) {
+    await w.clock.advance(30_000)
+    pct += 1
+    w.limits = [five(pct), seven(11)]
+  }
+  await w.clock.advance(10_000)
+  await shows(pane($), /at this pace/)
+  for (const cols of [60, 100]) {
+    const [, , meters] = await bandLines($, cols)
+    expect(columns(meters), `${cols} columns`).toBeLessThanOrEqual(cols - 4)
+    expect(textOf(meters)).toMatch(/^Spend \$87\.60 left 12%/)
+    expect(textOf(meters)).toMatch(/Context /)
+  }
+  expect(await labels($)).toEqual(['Spend', '5h limit', 'Context'])
+})
+
+// The "extra line under Context": the meters row ran past the band's width (Spend ⚠ 84% with its
+// bar, 5h, Weekly and Context is 97 columns of 96), so Context wrapped onto a second line
+test('the band meters never run past the band, so nothing wraps under Context', async ($, on) => {
+  const w = world(on)
+  await busy($, w, SPEND(8420, 10000))
+  const lines = await bandLines($, 100)
+  expect(lines.length).toBe(3)
+  expect(columns(lines[2])).toBeLessThanOrEqual(96)
+  expect(textOf(lines[2])).toMatch(/^Spend \$15\.80 left ⚠ 84%/)
+  expect(textOf(lines[2])).toMatch(/Context ━+ 10%$/)
+})
+
+test('the Left tile: what is left of the spend limit, coloured by its level', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), exactly('Left'), exactly('$87.60'))
+  expect(await color(pane($), exactly('$87.60'))).toBe('success')
+  await fits($, w)
+  // too narrow for four tiles: no Left tile
+  const narrow = (): Promise<Ui> => $.ui.mount({
+    plugin: 'usage-radar', surface: 'terminal', component: 'Pane', requestId: 'radar-agents',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 40 } as never,
+  })
+  await hidden(narrow(), exactly('Left'))
+  await shows(narrow(), /^Spend/)
+})
+
+test('no Left tile without a spend limit', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(30)]
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await hidden(pane($), exactly('Left'), exactly('Over'))
+})
+
+test('an open panel grows when the dollars arrive for Claude Code\'s own Spend row', async ($, on) => {
+  const w = world(on)
+  w.limits = [{ kind: 'spend_limit', percentUsed: 12 }]
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radar($)
+  await shows(pane($), /^Spend/)
+  const opened = w.opened.length
+  const rows = w.opened.at(-1) ?? 0
+  spendOn(w, SPEND(1240, 10000))
+  await w.clock.advance(60_000)
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 1)
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+})
+
+// The panel opened before the session had a name (a first prompt with no words in it gives
+// none): with showName the name row comes with the name
+const openedUnnamed = async ($: Engine, w: World) => {
+  await begin($, w)
+  await job($, w, '?', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  return { opened: w.opened.length, rows: w.opened.at(-1) ?? 0 }
+}
+const drawnAsOpened = async ($: Engine, w: World) => {
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+}
+
+// /radar opened before the first prompt: that prompt names the session and brings the Context
+// meter; the panel takes both at once, then the first request's line, and after the job it is
+// exactly as tall as it draws (the name is shown by default, so this is the usual first session)
+for (const [kind, options] of [['by default', {}], ['showName on', { showName: true }], ['showName off', { showName: false }]] as const) {
+  const showName = (options as { showName?: boolean }).showName !== false
+  test(`an open panel takes the first prompt's rows${showName ? ', the name row too' : ''} (${kind})`, { options: options as never }, async ($, on) => {
+    const w = world(on)
+    await begin($, w)
+    await radar($)
+    const opened = w.opened.length
+    await prompt($, 'DEMO-7 tidy the docs')
+    expect(record(w)?.name).toBe('DEMO-7')
+    expect(w.opened.length).toBe(opened + 1)
+    // no agent row yet ("No agents yet"): the panel is a little taller than it draws, never shorter
+    let ui: any = await pane($)
+    expect(w.opened.at(-1)).toBeGreaterThanOrEqual(height(await ui.drawn()))
+    await ui.unmount()
+    if (showName) await shows(pane($), exactly('DEMO-7'))
+    else await hidden(pane($), /DEMO-7/)
+    await start($, 'm')
+    w.cost = 0.01
+    await step($, w, 'm', 1000, 0)
+    // the first request brings its line: one more resize
+    expect(w.opened.length).toBe(opened + 2)
+    await complete($, 'm')
+    expect(w.opened.length).toBe(opened + 2)
+    await drawnAsOpened($, w)
+    if (showName) await shows(pane($), exactly('DEMO-7'))
+    else await hidden(pane($), /DEMO-7/)
+  })
+}
+
+test('with showName, a later prompt naming the session grows an open panel by its row', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  const { opened, rows } = await openedUnnamed($, w)
+  expect(record(w)?.name).toBeFalsy()
+  await prompt($, 'DEMO-7 tidy the docs')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 1)
+  await shows(pane($), exactly('DEMO-7'))
+  await drawnAsOpened($, w)
+})
+
+test('with showName off, a later prompt naming the session leaves an open panel as it is', { options: { showName: false } }, async ($, on) => {
+  const w = world(on)
+  const { opened } = await openedUnnamed($, w)
+  await prompt($, 'DEMO-7 tidy the docs')
+  expect(record(w)?.name).toBe('DEMO-7')
+  expect(w.opened.length).toBe(opened)
+  await hidden(pane($), /DEMO-7/)
+  await drawnAsOpened($, w)
+})
+
+// The 5h and weekly limits come with a reading after the first response: an open panel takes
+// their rows, and gives them back when they go
+test('an open panel grows when the 5h and weekly meters arrive with a reading', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  const rows = w.opened.at(-1) ?? 0
+  await measure($, [five(23), seven(9)])
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 4)
+  await drawnAsOpened($, w)
+  // the same reading again: no resize
+  await measure($, [five(24), seven(9)])
+  expect(w.opened.length).toBe(opened + 1)
+  await measure($, [])
+  expect(w.opened.at(-1)).toBe(rows)
+  await drawnAsOpened($, w)
+})
+
+test('with showName, /rename on an unnamed session grows an open panel once; a second /rename does not', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  const { opened, rows } = await openedUnnamed($, w)
+  await rename($, 'first pass')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows + 1)
+  await drawnAsOpened($, w)
+  await rename($, 'second pass')
+  expect(w.opened.length).toBe(opened + 1)
+  await shows(pane($), exactly('second pass'))
+  await drawnAsOpened($, w)
+})
+
+// The band header never runs past the band: it drops "tokens", then the clock, then the model,
+// never the cost; the badge and the name only get what's left
+const headerAt = async ($: Engine, cols: number, fitting = true) => {
+  const [header] = await bandLines($, cols)
+  const text = textOf(header)
+  if (fitting) expect(columns(header), `${cols} columns: ${text}`).toBeLessThanOrEqual(Math.max(30, cols - 4))
+  return text
+}
+
+for (const budget of [false, true]) {
+  test(`the band header drops tokens, the clock, then the model to fit${budget ? ', the budget cost staying' : ''}`, { options: { ...LABELS, showEmail: false } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+    await job($, w, 'go', 0.03, 31_000)
+    if (budget) await radarCmd($, 'budget 7')
+    const cost = budget ? '≈$0.03 / $7.00' : '≈$0.03'
+    const fixed = `◉ Usage Radar   ✳ Opus 5.5   # 31k tokens   ${cost}   ⏱ 0:00`
+    // everything fits, the badge and the name too
+    const wide = await headerAt($, fixed.length + 4 + 3 + '[WORK]'.length + 3 + 6)
+    expect(wide).toBe(`◉ Usage Radar✳ Opus 5.5# 31k tokens${cost}⏱ 0:00[WORK]go`)
+    // one column short of the fixed items: "tokens" goes, the badge and the name first
+    expect(await headerAt($, fixed.length + 3)).toBe(`◉ Usage Radar✳ Opus 5.5# 31k${cost}⏱ 0:00`)
+    // then the clock
+    const noClock = fixed.length - ' tokens'.length - '   ⏱ 0:00'.length
+    expect(await headerAt($, noClock + 4)).toBe(`◉ Usage Radar✳ Opus 5.5# 31k${cost}`)
+    // then the model; the badge gets the room that frees
+    expect(await headerAt($, noClock + 3)).toBe(`◉ Usage Radar# 31k${cost}[WORK]`)
+    // very narrow: the cost still shows (with a budget, the title and the cost alone are wider than the band)
+    expect(await headerAt($, 20, !budget)).toBe(`◉ Usage Radar# 31k${cost}`)
+  })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.0: private mode and the defaults (the email and the name show unless turned off)
+// ════════════════════════════════════════════════════════════════════════════
+const HINT_TEXT = /^ ?\(\/radar private to hide\)$/
+// a work account in ~/.claude.json (a made-up address)
+const workWorld = (on: any, seed: Record<string, unknown> = {}, email = 'you@work.example.com') => {
+  const w = world(on, seed, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account(email)
+  return w
+}
+
+test('by default the band shows the email with a dim hint, then the name', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const ui = await band($, 160)
+  const badge = await ui.find({ type: 'Text', text: exactly('[WORK] you@work.example.com') })
+  expect(badge?.props.color).toBe('warning')
+  const hint = await ui.find({ type: 'Text', text: HINT_TEXT })
+  expect(hint?.props.dimColor).toBe(true)
+  await ui.unmount()
+  const [header] = await bandLines($, 160)
+  expect(textOf(header)).toMatch(/⏱ 0:00\[WORK\] you@work\.example\.com \(\/radar private to hide\)DEMO-142$/)
+  expect(columns(header)).toBeLessThanOrEqual(156)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  await fits($, w)
+})
+
+test('by default an unlabelled account shows its email and the hint in the panel', { options: { accounts: ['work.example.com=WORK'] } }, async ($, on) => {
+  const w = workWorld(on, {}, 'you@gmail.com')
+  await job($, w, 'go', 0.01)
+  await shows(pane($), exactly('you@gmail.com'), HINT_TEXT)
+  await fits($, w)
+})
+
+test('/radar private hides the email, the name and the hint everywhere, and remembers it', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  expect((await radarCmd($, 'private')).text).toBe('Private mode on: email and session name hidden.')
+  const [header] = await bandLines($, 160)
+  expect(textOf(header)).toMatch(/\[WORK\]$/)
+  await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+  await hidden(pane($), /@/, /DEMO-142/, /radar private/)
+  await shows(pane($), exactly('[WORK]'))
+  await fits($, w)
+  // the name is still kept, so it comes back
+  expect(record(w)?.name).toBe('DEMO-142')
+  expect(w.store.get('private')).toBe(true)
+})
+
+test('/radar private off shows the email, the name and the hint again', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  expect((await radarCmd($, 'private off')).text).toBe('Private mode off: email and session name shown.')
+  await shows(band($, 160), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  await shows(pane($), exactly('[WORK] you@work.example.com'), HINT_TEXT, exactly('DEMO-142'))
+  expect(w.store.get('private')).toBe(false)
+  await fits($, w)
+})
+
+for (const args of ['private on', 'PRIVATE', 'Private  ON']) {
+  test(`/radar ${args} turns private mode on`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    expect((await radarCmd($, args)).text).toBe('Private mode on: email and session name hidden.')
+    expect(w.store.get('private')).toBe(true)
+    await hidden(pane($), /@/, /DEMO-142/)
+  })
+}
+
+test('/radar private resizes an open panel by the name row, only when it changes', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radar($)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  const rows = w.opened.at(-1) ?? 0
+  await radarCmd($, 'private')
+  expect(w.opened.length).toBe(opened + 1)
+  expect(w.opened.at(-1)).toBe(rows - 1)
+  await drawnAsOpened($, w)
+  // already on: no resize
+  await radarCmd($, 'private')
+  expect(w.opened.length).toBe(opened + 1)
+  await radarCmd($, 'private off')
+  expect(w.opened.length).toBe(opened + 2)
+  expect(w.opened.at(-1)).toBe(rows)
+  await drawnAsOpened($, w)
+})
+
+test('/radar private takes the badge row of an unlabelled account too', { options: { accounts: ['work.example.com=WORK'] } }, async ($, on) => {
+  const w = workWorld(on, {}, 'you@gmail.com')
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radar($)
+  const rows = w.opened.at(-1) ?? 0
+  await radarCmd($, 'private')
+  expect(w.opened.at(-1)).toBe(rows - 2)
+  await drawnAsOpened($, w)
+  await hidden(pane($), /@/, /DEMO-142/)
+})
+
+test('/radar private with the panel closed opens nothing', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  expect(w.opened.length).toBe(0)
+})
+
+test('private mode stays on in a new process and a new session', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: true })
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  // /clear: a new session id keeps it
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'DEMO-7 another thing', 0.01)
+  await hidden(pane($), /@/, /DEMO-7/)
+  expect(record(w)?.name).toBe('DEMO-7')
+})
+
+test('a stored private value that is not true counts as off', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: 'yes' })
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+})
+
+test('private mode set in one session carries to the next', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  w.sid = 's2'
+  w.cost = 0
+  await job($, w, 'DEMO-7 another thing', 0.01)
+  await hidden(band($, 160), /@/, /DEMO-7/)
+  await hidden(pane($), /@/, /DEMO-7/)
+})
+
+test('the store only keeps sessions and the private boolean, never the email', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  const all = JSON.stringify([...w.store.entries()])
+  expect(all).not.toContain('work.example.com')
+  expect(all).not.toContain('@')
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private')).toBe(true)
+  expect(w.store.get('private')).toBe(false)
+})
+
+test('showEmail and showName off: just the label, no hint, no name, before and after private mode', { options: { ...LABELS, showEmail: false, showName: false } }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const check = async () => {
+    const [header] = await bandLines($, 160)
+    expect(textOf(header)).toMatch(/\[WORK\]$/)
+    await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+    await hidden(pane($), /@/, /DEMO-142/, /radar private/)
+    await shows(pane($), exactly('[WORK]'))
+  }
+  await check()
+  await radarCmd($, 'private')
+  await radarCmd($, 'private off')
+  await check()
+  await fits($, w)
+})
+
+test('/radar private with anything else after it: a usage reply, nothing changes', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  expect((await radarCmd($, 'private maybe')).text).toBe('Usage Radar: use /radar private or /radar private off')
+  expect(w.store.has('private')).toBe(false)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+})
+
+// The hint goes whole, before the name and the badge; never cut
+for (const cols of [100, 120, 160]) {
+  test(`the band header at ${cols} columns: the badge first, then the name, then the hint, never cut`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    const lines = await bandLines($, cols)
+    expect(lines.length).toBe(3)
+    const text = textOf(lines[0])
+    expect(columns(lines[0])).toBeLessThanOrEqual(cols - 4)
+    expect(text).not.toMatch(/…/)
+    expect(text).toMatch(/\[WORK\] you@work\.example\.com/)
+    if (cols === 100) expect(text).toMatch(/\[WORK\] you@work\.example\.com$/)
+    if (cols === 120) expect(text).toMatch(/\[WORK\] you@work\.example\.comDEMO-142$/)
+    if (cols === 160) expect(text).toMatch(/\(\/radar private to hide\)DEMO-142$/)
+    if (cols !== 160) expect(text).not.toMatch(/\(\/radar|private/)
+  })
+}
+
+test('a panel too narrow for the hint keeps the whole badge, without the hint', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, {}, 'firstname.lastname@work.example.com')
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] firstname.lastname@work.example.com'))
+  await hidden(pane($), /radar private/, /…/)
+  await fits($, w)
+})
+
+test('/radar private never names the session', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await prompt($, '/radar private', { name: 'radar', args: 'private' })
+  await radarCmd($, 'private')
+  expect(record(w)?.name ?? null).toBeNull()
+  await prompt($, '/radar private off', { name: 'radar', args: 'private off' })
+  await radarCmd($, 'private off')
+  await job($, w, 'DEMO-9 the real work', 0.01)
+  expect(record(w)?.name).toBe('DEMO-9')
+  await shows(pane($), exactly('DEMO-9'))
+})
+
+test('a mounted band redraws after /radar private', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  const ui = await band($, 160)
+  expect(await ui.find({ type: 'Text', text: /@/ })).toBeDefined()
+  await radarCmd($, 'private')
+  expect(await ui.find({ type: 'Text', text: /@/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /DEMO-142/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+// The band header at 60 columns: "tokens", then the clock go; the cost always stays
+for (const budget of [false, true]) {
+  test(`the band header fits 60 columns${budget ? ' with a budget' : ''}: the cost stays`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on)
+    await job($, w, 'go', 0.03, 31_000)
+    if (budget) await radarCmd($, 'budget 7')
+    const text = await headerAt($, 60)
+    expect(text).toBe(budget ? '◉ Usage Radar✳ Opus 5.5# 31k≈$0.03 / $7.00' : '◉ Usage Radar✳ Opus 5.5# 31k≈$0.03⏱ 0:00')
+  })
+}
+
+// The last request: none until the session's first model request, then always
+test('the last request line waits for the first request', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await radar($)
+  await hidden(pane($), /last request/)
+  await prompt($, 'go')
+  await start($, 'm')
+  await hidden(band($), /last request/)
+  await hidden(pane($), /last request/)
+  await drawnAsOpened($, w)
+  const opened = w.opened.length
+  w.cost = 0.20
+  await step($, w, 'm', 10_000, 1_000)
+  expect(w.opened.length).toBe(opened + 1)
+  await shows(band($), /last request ≈\$0\.20 · 11k tokens/)
+  await shows(pane($), /^last request ≈\$0\.20 · 11k tokens/)
+  await drawnAsOpened($, w)
+  await complete($, 'm')
+  // the next prompt keeps it: the session has had a request
+  await prompt($, 'more')
+  await start($, 'm2')
+  await shows(pane($), /^last request/)
+  expect(w.opened.length).toBe(opened + 1)
+})
+
+test('a broken store: private mode starts off, and /radar private still hides the email on screen', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: true })
+  w.storeBroken = true
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  // the stored true can't be read: off
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+  expect((await radarCmd($, 'private')).text).toBe('Private mode on: email and session name hidden.')
+  await hidden(band($, 160), /@/, /DEMO-142/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  await shows(pane($), exactly('[WORK]'))
 })

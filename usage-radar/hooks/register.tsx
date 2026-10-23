@@ -37,15 +37,17 @@ const EMPTY: Live = {
   pace: { wall: null, active: 0, kinds: {} },
   account: null,
   spend: null,
+  private: false,
 }
-const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v5' })
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v6' })
 
 const PANE = 'radar-agents'
-// name (1) + tiles (4) + this request (1) + summary (2) + the limits block (2 + 2 per meter, when
-// shown) + 3 rows per agent + the "+N earlier" line (2, when shown) + session total (2), and the dock width.
-// `extra`: the account row and the budget bar under the cost tile (1 each, when shown)
+// tiles (4) + summary (2) + the limits block (2 + 2 per meter, when shown) + 3 rows per
+// agent + the "+N earlier" line (2, when shown) + session total (2), and the dock width.
+// `extra`: the name row, the account row, the budget bar under the cost tile, the Spend
+// dollars line and the last request (1 each, when shown)
 const paneRows = (agents: number, limits: number, hasMore = false, extra = 0): number =>
-  12 + extra + (limits > 0 ? 2 + 2 * limits : 0) + 3 * Math.max(1, agents) + (hasMore ? 2 : 0)
+  10 + extra + (limits > 0 ? 2 + 2 * limits : 0) + 3 * Math.max(1, agents) + (hasMore ? 2 : 0)
 const PANE_COLUMNS = 64
 const ROWS = 8 // helper rows on screen; the rest share one line
 const TICK_MS = 250
@@ -72,6 +74,7 @@ const REARM_MS = 60 * 60_000 // the warnings can come again once it's an hour aw
 const SAVE_MS = 15_000
 const PRUNE_MS = 90 * 24 * 60 * 60 * 1000 // sessions unused for 90 days are forgotten
 const KEY = (id: string): string => `session:${id}`
+const PRIVATE_KEY = 'private' // /radar private: true or false, for every session (never the email)
 
 // Colours: theme keys, not raw hex, so they stay readable on light and dark terminals
 const ORANGE = 'claude'
@@ -187,12 +190,16 @@ const earlierLine = (p: Live): string | null => {
   ].filter(Boolean)
   return parts.length ? parts.join('  ·  ') : null
 }
-const panelRows = (p: Live, limits: number, showAccount: boolean): number =>
+const panelRows = (p: Live, cfg: Config): number =>
   paneRows(
     (main(p) ? 1 : 0) + helperRows(p).shown.length,
-    limits,
+    meters(p).length,
     earlierLine(p) !== null,
-    (showAccount && p.account ? 1 : 0) + (p.budget !== null ? 1 : 0),
+    (nameShown(p, cfg) ? 1 : 0) +
+      (badgeFor(p, cfg) ? 1 : 0) +
+      (p.budget !== null ? 1 : 0) +
+      (meters(p).some(m => m.spend) ? 1 : 0) +
+      (hasRequest(p) ? 1 : 0),
   )
 
 // The clock stands still when nobody works: the job is over, or every running agent is idle
@@ -234,9 +241,11 @@ const sessionAgents = (p: Live): number => (main(p) || p.sessionSteps || p.sessi
 // 1 → "1 step", 3 → "3 steps"
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
-// The dim line under the totals: just the current request
-const thisRequest = (p: Live): string =>
-  `this request: ${money(jobCost(p))} · ${k(p.jobTokens)} · ${elapsed(p)} · ${plural(p.steps, 'step')}`
+// The session made its first model request (until then there's no last request to show)
+const hasRequest = (p: Live): boolean => p.sessionTokens > 0
+
+// Just the last request: "last request ≈$0.20 · 11k tokens · 0:05"
+const lastRequest = (p: Live): string => `last request ${money(jobCost(p))} · ${k(p.jobTokens)} tokens · ${elapsed(p)}`
 
 // A new reading of the engine's cost ledger: add what changed since the last one.
 // The ledger sums every priced response of this session id, so it never goes down; a lower
@@ -411,6 +420,7 @@ const freshSession = (p: Live, id: string, saved: Saved | null, ledger: number |
     pace: p.pace,
     account: p.account,
     spend: p.spend,
+    private: p.private,
     lastLedger: ledger,
     ...(saved && {
       name: saved.name,
@@ -602,7 +612,7 @@ const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object
 const fin = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 // how many decimals an amount in minor units has (0 to 6), else null
 const exp = (x: unknown): number | null => (Number.isInteger(x) && (x as number) >= 0 && (x as number) <= 6 ? (x as number) : null)
-// { amount_minor: 8840, exponent: 2 } → 88.4
+// { amount_minor: 1240, exponent: 2 } → 12.40
 const amount = (m: unknown): number | null => {
   if (!isObj(m) || !fin(m.amount_minor)) return null
   const e = exp(m.exponent)
@@ -643,20 +653,18 @@ const jsonObject = (text: string): Record<string, unknown> | null => {
   }
 }
 
-// 88.404 → "$88.40", 100 → "$100"; another currency: "88.40 EUR"
+// 12.404 → "$12.40", 100 → "$100"; another currency: "12.40 EUR"
 const cash = (n: number, currency: string): string => {
   const c = Math.round(n * 100) / 100
   const text = Number.isInteger(c) ? `${c}` : c.toFixed(2)
   return currency === 'USD' ? `$${text}` : `${text} ${currency}`
 }
 
-// "$88.40 used · $11.60 left of $100", or "$102.70 used · $2.70 over $100"
-const spendText = (s: Spend): string => {
-  const left = s.cap - s.used
-  return left >= 0
-    ? `${cash(s.used, s.currency)} used · ${cash(left, s.currency)} left of ${cash(s.cap, s.currency)}`
-    : `${cash(s.used, s.currency)} used · ${cash(-left, s.currency)} over ${cash(s.cap, s.currency)}`
-}
+// What's left of the spend limit ("Left", "$87.60"), or how much over it ("Over", "$3.50")
+const spendLeft = (s: Spend): { title: string; text: string } =>
+  s.cap - s.used >= 0 ? { title: 'Left', text: cash(s.cap - s.used, s.currency) } : { title: 'Over', text: cash(s.used - s.cap, s.currency) }
+// "$12.40 of $100 used"
+const spendUsed = (s: Spend): string => `${cash(s.used, s.currency)} of ${cash(s.cap, s.currency)} used`
 
 // ── The forecast: when a limit runs out at the pace it fills while working ──
 // The clock here is working time: a gap of over a minute between two readings, time while
@@ -731,6 +739,39 @@ const meters = (p: Live): Meter[] => {
     ...p.limits.filter(l => l.kind !== 'spend_limit').map(l => limitMeter(p, l)),
     ...(p.contextPct === null ? [] : [{ key: 'context', label: 'Context', pct: p.contextPct, left: null }]),
   ]
+}
+
+// "⚠ 84%", "⛔ 103%", or just "40%" under 80%
+const glyph = (pctUsed: number): string => (pctUsed >= DANGER ? '⛔' : pctUsed >= WARN ? '⚠' : '')
+const levelText = (pctUsed: number): string => `${glyph(pctUsed) ? `${glyph(pctUsed)} ` : ''}${Math.round(pctUsed)}%`
+// a forecast after a meter: " · ~25m left"
+const paceText = (m: Meter): string => (m.left !== null ? ` · ${leftText(m.left)}` : '')
+
+// How wide one meter is on the band: "Spend $87.60 left ⚠ 84%" (the dollars, no bar), else
+// "5h limit ━━━━━━━━━━ 84% ⚠"; then its forecast
+const BAND_BAR = 10
+const bandWidth = (m: Meter): number => {
+  const l = m.spend ? spendLeft(m.spend) : null
+  const body = l
+    ? `${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}`.length
+    : `${m.label} `.length + BAND_BAR + ` ${Math.round(m.pct)}%`.length + (m.pct >= WARN ? 2 : 0)
+  return body + paceText(m).length
+}
+
+// The meters that fit on the band's one line (3 spaces apart): Spend first, then Context, then
+// the fullest. The first always stays; they're drawn in their usual order
+const bandMeters = (p: Live, width: number): Meter[] => {
+  const all = meters(p)
+  const rank = (m: Meter): number => (m.key === 'spend_limit' ? 2 : m.key === 'context' ? 1 : 0)
+  const kept: Meter[] = []
+  let used = 0
+  for (const m of [...all].sort((a, b) => rank(b) - rank(a) || b.pct - a.pct)) {
+    const w = bandWidth(m) + (kept.length ? 3 : 0)
+    if (kept.length && used + w > width) break
+    kept.push(m)
+    used += w
+  }
+  return all.filter(m => kept.includes(m))
 }
 
 // Which meters crossed 80% or 95% since the last reading: one alert per level
@@ -823,7 +864,8 @@ const parseBudgetArg = (arg: string): number | 'show' | 'off' | null => {
 type Config = {
   accounts: { domain: string; label: string }[]
   showAccount: boolean
-  hideEmail: boolean
+  showEmail: boolean
+  showName: boolean
   defaultBudget: number | null
   showSpend: boolean
 }
@@ -839,7 +881,8 @@ const configOf = (o: PluginOptions): Config => {
   return {
     accounts,
     showAccount: o.showAccount !== false,
-    hideEmail: o.hideEmail === true,
+    showEmail: o.showEmail !== false,
+    showName: o.showName !== false,
     defaultBudget: typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? budget : null,
     showSpend: o.showSpend !== false,
   }
@@ -857,13 +900,27 @@ const labelFor = (email: string, accounts: Config['accounts']): string | null =>
 // WORK amber, PERSONAL green, any other label orange
 const labelColor = (label: string): string => (/^work$/i.test(label) ? AMBER : /^personal$/i.test(label) ? GREEN : ORANGE)
 
-// "[WORK] me@acme.com"; with no label just who it is (email, else organization, else config dir)
-const badgeOf = (a: Account, cfg: Config): { text: string; color: string | undefined } => {
+// The dim hint next to a shown email, when there's room for all of it
+const HINT = '(/radar private to hide)'
+
+// The account badge: its text, its colour (a label's; none for a bare email) and whether it shows the email
+type Badge = { text: string; color: string | undefined; hasEmail: boolean }
+
+// "[WORK] me@acme.com", or "[WORK]" with no email (showEmail off, private mode, none known).
+// No label: just the email, else no badge at all (null). Never the organization or the config
+// dir: those can name the company
+const badgeOf = (a: Account, cfg: Config, hide: boolean): Badge | null => {
+  const email = cfg.showEmail && !hide && !!a.email
   const label = a.email ? labelFor(a.email, cfg.accounts) : null
-  const who = a.email ?? a.org ?? a.configDir
-  if (label) return { text: cfg.hideEmail ? `[${label}]` : `[${label}] ${who}`, color: labelColor(label) }
-  return { text: cfg.hideEmail && a.email ? (a.org ?? a.configDir) : who, color: undefined }
+  if (label) return { text: email ? `[${label}] ${a.email}` : `[${label}]`, color: labelColor(label), hasEmail: email }
+  return email && a.email ? { text: a.email, color: undefined, hasEmail: true } : null
 }
+// The badge the band and the panel draw, or null (showAccount off, no account yet, or nothing to show)
+const badgeFor = (p: Live, cfg: Config): Badge | null =>
+  cfg.showAccount && p.account ? badgeOf(p.account, cfg, p.private) : null
+
+// The session name the band and the panel draw, or null (showName off, private mode, no name yet)
+const nameShown = (p: Live, cfg: Config): string | null => (cfg.showName && !p.private ? p.name : null)
 
 // The two fields we use from Claude Code's account file; anything odd counts as missing
 const parseAccountFile = (text: string): { email: string | null; org: string | null } => {
@@ -877,7 +934,8 @@ const parseAccountFile = (text: string): { email: string | null; org: string | n
   }
 }
 
-// "/Users/me/.claude-work" → "~/.claude-work"; outside home just the folder's name
+// "/Users/me/.claude-work" → "~/.claude-work"; outside home just the folder's name. Never drawn:
+// a config folder name can reveal the company (like ~/.claude-acme)
 const shortDir = (path: string, home: string | undefined): string => {
   const dir = path.replace(/\/+$/, '') || path
   const h = home?.replace(/\/+$/, '')
@@ -975,6 +1033,17 @@ const load = async ($: EngineInterface, id: string): Promise<Saved | null> => {
   }
 }
 
+// Private mode, for every session: on only when the store says true (anything else is off).
+// Only that one boolean is kept, never the email or the name
+const loadPrivate = async ($: EngineInterface): Promise<void> => {
+  try {
+    const stored = (await $.store.get(PRIVATE_KEY)) === true
+    await update($, live, p => (p.private === stored ? p : { ...p, private: stored }))
+  } catch {
+    // keep what we have
+  }
+}
+
 // Forget sessions not used for 90 days (and records we can't read). Other keys are left alone.
 const prune = async ($: EngineInterface, current: string): Promise<void> => {
   try {
@@ -1014,22 +1083,37 @@ const detectAccount = async ($: EngineInterface): Promise<Account> => {
     try {
       found = parseAccountFile(String(await $.fs.read(file)))
     } catch {
-      // no file (an API key, Bedrock, Vertex...): the badge shows the config dir
+      // no file (an API key, Bedrock, Vertex...): no email, so no badge unless labelled
     }
   }
+  // configDir is kept but never drawn (a config folder name can reveal the company)
   return { ...found, configDir: dir ? shortDir(dir, home) : '~/.claude' }
 }
 
 // An open panel takes its new height (a meter or the budget bar came or went); a closed one is
 // sized when it opens
-const resizeIfOpen = async ($: EngineInterface, p: Live, showAccount: boolean): Promise<void> => {
+const resizeIfOpen = async ($: EngineInterface, p: Live, cfg: Config): Promise<void> => {
   try {
     if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
-      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, meters(p).length, showAccount), columns: PANE_COLUMNS })
+      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, cfg), columns: PANE_COLUMNS })
     }
   } catch {
     // ignore: the next open sizes it
   }
+}
+
+// An open panel takes its new height only when it changed
+const resizeIfChanged = async ($: EngineInterface, before: Live, after: Live, cfg: Config): Promise<void> => {
+  if (panelRows(before, cfg) !== panelRows(after, cfg)) await resizeIfOpen($, after, cfg)
+}
+
+// /rename: the session gets its name (or a new one), saved; while the name is shown an open panel
+// takes the name row when it first comes
+const nameSession = async ($: EngineInterface, cfg: Config, name: string, kind: NameKind): Promise<void> => {
+  const before = await read($, live)
+  const after = await update($, live, p => withName(p, name, kind))
+  await save($)
+  await resizeIfChanged($, before, after, cfg)
 }
 
 // ── The spend limit, read from Anthropic once a minute (also while idle) ──
@@ -1089,8 +1173,8 @@ const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, ac
   })
   for (const a of alerts) $.ui.toast(a)
   if (after !== before) $.ui.status(statusLine(after))
-  // the Spend row came or went: an open panel takes its new height
-  if (meters(before).length !== meters(after).length) await resizeIfOpen($, after, cfg.showAccount)
+  // the Spend row or its dollars (or the account's badge) came or went: an open panel takes its new height
+  if (panelRows(before, cfg) !== panelRows(after, cfg)) await resizeIfOpen($, after, cfg)
 }
 
 // Read the spend limit, at most once a minute (from the minute timer, or an event: start, a prompt,
@@ -1310,9 +1394,14 @@ export const register: Register = (on, options) => {
 
   // ── Startup: pick up this session's totals, add the /radar command ─────
   on('session.start', async ($, e, next) => {
+    await loadPrivate($)
     await syncSession($, cfg)
     startSpend($, cfg)
-    await $.command.register({ name: 'radar', description: 'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session' })
+    await $.command.register({
+      name: 'radar',
+      description:
+        'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
+    })
     return next(e)
   })
 
@@ -1328,20 +1417,14 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', async ($, e, next) => {
     await syncSession($, cfg)
     const title = e.session_title?.trim()
-    if (title) {
-      await update($, live, p => withName(p, title, 'rename'))
-      await save($)
-    }
+    if (title) await nameSession($, cfg, title, 'rename')
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     await syncSession($, cfg)
     const title = e.session_title?.trim()
-    if (title) {
-      await update($, live, p => withName(p, title, 'rename'))
-      await save($)
-    }
+    if (title) await nameSession($, cfg, title, 'rename')
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -1351,22 +1434,36 @@ export const register: Register = (on, options) => {
     try {
       await syncSession($, cfg)
       const title = e.args.trim()
-      if (title) {
-        await update($, live, p => withName(p, title, 'rename'))
-        await save($)
-      }
+      if (title) await nameSession($, cfg, title, 'rename')
     } catch {
       // the rename itself already happened
     }
     return r
   }).catch(($, e, next) => next(e))
 
-  // ── /radar opens the panel; /radar budget <amount|off> sets this session's budget ─
+  // ── /radar opens the panel; /radar budget <amount|off> sets this session's budget;
+  //    /radar private [on|off] hides (or shows again) the email and the session name, every session ─
   on('command.run', { command: 'radar' }, async ($, e) => {
+    const pm = /^private\b\s*(.*)$/i.exec(e.args.trim())
+    if (pm) {
+      const a = (pm[1] ?? '').trim().toLowerCase()
+      if (a !== '' && a !== 'on' && a !== 'off') return { text: 'Usage Radar: use /radar private or /radar private off' }
+      const hide = a !== 'off'
+      const before = await read($, live)
+      const after = await update($, live, p => (p.private === hide ? p : { ...p, private: hide }))
+      try {
+        await $.store.set(PRIVATE_KEY, hide)
+      } catch {
+        // not kept for the next session; this one still changes
+      }
+      // the name row (and an unlabelled badge) came or went: an open panel takes its new height
+      await resizeIfChanged($, before, after, cfg)
+      return { text: hide ? 'Private mode on: email and session name hidden.' : 'Private mode off: email and session name shown.' }
+    }
     const m = /^budget\b\s*(.*)$/i.exec(e.args.trim())
     if (!m) {
       const p = await read($, live)
-      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, meters(p).length, cfg.showAccount), columns: PANE_COLUMNS })
+      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, cfg), columns: PANE_COLUMNS })
       return { text: 'Usage Radar opened.' }
     }
     await syncSession($, cfg)
@@ -1385,7 +1482,7 @@ export const register: Register = (on, options) => {
     const p = await update($, live, q => withBudgetSet(q, arg === 'off' ? null : arg))
     await save($)
     // the budget bar came or went under the cost tile: an open panel takes its new height
-    if ((before === null) !== (p.budget === null)) await resizeIfOpen($, p, cfg.showAccount)
+    if ((before === null) !== (p.budget === null)) await resizeIfOpen($, p, cfg)
     if (arg === 'off') return { text: 'Budget off for this session.' }
     const past = p.budgetFired > 0 ? ` · already past ${p.budgetFired}%` : ''
     return { text: `Budget set: ${dollars(arg)} for this session · ${money(totalCost(p))} spent so far${past}` }
@@ -1393,6 +1490,8 @@ export const register: Register = (on, options) => {
 
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
+    // an open panel takes the rows this prompt brings (the name, the Context meter) at once, below
+    const before = await read($, live)
     await syncSession($, cfg)
     // the spend limit: checked now (at most once a minute), and from here on if it wasn't yet
     if (!spendTimer) startSpend($, cfg)
@@ -1406,7 +1505,11 @@ export const register: Register = (on, options) => {
       }
     }
 
-    if (e.command) return next(e) // slash commands like /radar don't start a new job
+    // slash commands like /radar don't start a new job
+    if (e.command) {
+      await resizeIfChanged($, before, await read($, live), cfg)
+      return next(e)
+    }
     const now = await $.clock.now()
     const usage = await $.session.usage()
     const cost = usage.cost?.usd ?? null
@@ -1427,6 +1530,7 @@ export const register: Register = (on, options) => {
     })
     $.ui.status(statusLine(p))
     for (const a of alerts) $.ui.toast(a)
+    await resizeIfChanged($, before, p, cfg)
 
     // the clock: ticks until the whole job is done
     startTicker($)
@@ -1460,7 +1564,7 @@ export const register: Register = (on, options) => {
 
     // a helper appeared → show the panel, tall enough for every agent
     if (e.agentId) {
-      void $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(after, meters(after).length, cfg.showAccount), columns: PANE_COLUMNS })
+      void $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(after, cfg), columns: PANE_COLUMNS })
     }
 
     return next(e)
@@ -1479,6 +1583,8 @@ export const register: Register = (on, options) => {
       const now = await $.clock.now()
       const fresh = freshTokens(u)
       let alerts: string[] = []
+      // the first request brings the last request row (and a reading may bring meters): an open panel takes them
+      const before = await read($, live)
       const p = await update($, live, p => {
         const counted = withWorking(withLedger({ ...p, window: usage.context.window || p.window }, usage.cost?.usd ?? null), id, now)
         const base = withAgent(
@@ -1499,6 +1605,7 @@ export const register: Register = (on, options) => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      await resizeIfChanged($, before, p, cfg)
       await saveSoon($)
     }
     return result
@@ -1570,6 +1677,7 @@ export const register: Register = (on, options) => {
   on('session.measure', async ($, e, next) => {
     try {
       const now = await $.clock.now()
+      const before = await read($, live)
       let alerts: string[] = []
       const p = await update($, live, p => {
         alerts = []
@@ -1579,6 +1687,8 @@ export const register: Register = (on, options) => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      // a meter came or went (the 5h or weekly limit): an open panel takes its new height
+      await resizeIfChanged($, before, p, cfg)
       void refreshSpend($, cfg)
     } catch {
       // ignore: the next reading catches up
@@ -1591,6 +1701,7 @@ export const register: Register = (on, options) => {
   // ════════════════════════════════════════════════════════════════════════
 
   // ── Band above the prompt: the "Usage Radar" card ────────────────────
+  // Three lines: the header (with the account and the name), what's going on, and the meters
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const p = await read($, live)
     const m = main(p)
@@ -1599,32 +1710,57 @@ export const register: Register = (on, options) => {
     const { Box, Text } = $.ui.resolve(e)
     const width = Math.max(30, e.props.bodyColumns - 4)
 
-    // the bar: to-do progress if Claude has a to-do list, else how full the context is
+    // the to-do list, if Claude has one: "1/2 tasks", and the task on the go (unless the activity shows it)
     const done = p.todos.filter(t => t.status === 'completed').length
     const active = p.todos.find(t => t.status === 'in_progress')
-    const hasTodos = p.todos.length > 0
-    const fraction = hasTodos ? done / p.todos.length : m.context / p.window
-    const barLabel = hasTodos
-      ? `${done}/${p.todos.length} tasks${active ? `  ·  ${active.activeForm || active.content}` : ''}`
-      : `${pct(fraction)} context`
-    const barWidth = Math.min(36, Math.max(10, Math.floor(width / 3)))
-    const b = bar(fraction, barWidth)
+    const doing = activity(p)
+    const task = active ? active.activeForm || active.content : ''
+    const tasks = p.todos.length
+      ? `  ·  ${done}/${p.todos.length} tasks${task && !doing.includes(task) ? `  ·  ${task}` : ''}`
+      : ''
 
     const working = helpers(p).filter(a => a.isRunning).length
     const all = jobHelpers(p).length
     const helperWord = all === 1 ? 'helper' : 'helpers'
     const crew = all ? `  ·  ${working ? `${working} of ${all} ${helperWord} working` : `${all} ${helperWord} done`}` : ''
 
-    // the session's name (bold), then this request's own numbers (dim)
-    const name = p.name ? fit(p.name, Math.min(28, Math.floor(width / 3))) : null
-    const request = name
-      ? fit(`  ·  ${thisRequest(p)}`, Math.max(10, width - name.length))
-      : fit(thisRequest(p), width)
-
     // the budget colours the cost (green, amber past 80%, red past 100%) and, past 80%, the border
     const lvl = p.budget === null ? 0 : budgetLevel(p.sessionCost, p.budget)
     const border = lvl >= 100 ? RED : lvl >= 80 ? AMBER : p.isRunning ? ORANGE : 'subtle'
-    const badge = cfg.showAccount && p.account ? badgeOf(p.account, cfg) : null
+
+    // line 1: the header; the badge, then the name (when shown), then the dim private-mode hint get
+    // what's left of it, or go (the hint whole or not at all)
+    const model = m.model ? prettyModel(m.model) : '…'
+    const cost = p.budget === null ? money(totalCost(p)) : budgetText(p)
+    // when it doesn't fit, it drops the word "tokens", then the clock, then the model; never the
+    // cost or the title, so at the 30-column floor a long budget cost can still run past the band
+    const headerAt = (drop: number): string[] =>
+      [
+        '◉ Usage Radar',
+        drop < 3 ? `✳ ${model}` : '',
+        `# ${k(p.sessionTokens)}${drop < 1 ? ' tokens' : ''}`,
+        cost,
+        drop < 2 ? `⏱ ${sessionClock(p)}` : '',
+      ].filter(Boolean)
+    let drop = 0
+    while (drop < 3 && headerAt(drop).join('   ').length > width) drop++
+    let room = width - headerAt(drop).join('   ').length - 3
+    const badge = badgeFor(p, cfg)
+    const badgeText = badge && room >= 6 ? fit(badge.text, room) : null
+    if (badgeText !== null) room -= badgeText.length + 3
+    const shownName = nameShown(p, cfg)
+    const name = shownName && room >= 6 ? fit(shownName, Math.min(28, room)) : null
+    const used =
+      headerAt(drop).join('   ').length + (badgeText !== null ? 3 + badgeText.length : 0) + (name !== null ? 3 + name.length : 0)
+    const hint = !!badge?.hasEmail && badgeText === badge.text && used + 1 + HINT.length <= width
+
+    // line 2: what's going on, then the steps, helpers, tasks and the last request (dim, once there is one)
+    const doingText = fit(doing, Math.max(10, width - 40))
+    const last = hasRequest(p) ? `  ·  ${lastRequest(p)}` : ''
+    const tail = fit(`  ·  ${plural(p.sessionSteps, 'step')}${crew}${tasks}${last}`, Math.max(0, width - 2 - doingText.length))
+
+    // line 3: the meters that fit
+    const shown = bandMeters(p, width)
 
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
@@ -1632,48 +1768,69 @@ export const register: Register = (on, options) => {
           <Text color={ORANGE} bold>
             ◉ Usage Radar
           </Text>
-          <Text>
-            <Text color={ORANGE}>✳ </Text>
-            <Text bold>{m.model ? prettyModel(m.model) : '…'}</Text>
-          </Text>
+          {drop < 3 && (
+            <Text>
+              <Text color={ORANGE}>✳ </Text>
+              <Text bold>{model}</Text>
+            </Text>
+          )}
           <Text>
             <Text dimColor># </Text>
             <Text bold>{k(p.sessionTokens)}</Text>
-            <Text dimColor> tokens</Text>
+            {drop < 1 && <Text dimColor> tokens</Text>}
           </Text>
           <Text>
             <Text color={p.budget === null ? AMBER : budgetColor(lvl)} bold>
-              {p.budget === null ? money(totalCost(p)) : budgetText(p)}
+              {cost}
             </Text>
           </Text>
-          <Text>
-            <Text dimColor>⏱ </Text>
-            <Text bold>{sessionClock(p)}</Text>
-          </Text>
-        </Box>
-        {badge && (
-          <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
-            {fit(badge.text, width)}
-          </Text>
-        )}
-        <Text>
+          {drop < 2 && (
+            <Text>
+              <Text dimColor>⏱ </Text>
+              <Text bold>{sessionClock(p)}</Text>
+            </Text>
+          )}
+          {badge && badgeText !== null && !hint && (
+            <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+              {badgeText}
+            </Text>
+          )}
+          {badge && badgeText !== null && hint && (
+            <Text>
+              <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+                {badgeText}
+              </Text>
+              <Text dimColor>{` ${HINT}`}</Text>
+            </Text>
+          )}
           {name !== null && <Text bold>{name}</Text>}
-          <Text dimColor>{request}</Text>
-        </Text>
-        <Text>
-          <Text color={hasTodos && done === p.todos.length ? GREEN : ORANGE}>{b.filled}</Text>
-          <Text dimColor>{b.empty}</Text>
-          <Text dimColor>  {fit(barLabel, width - barWidth - 3)}</Text>
-        </Text>
+        </Box>
         <Text>
           <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
-          <Text>{fit(activity(p), Math.max(10, width - 40))}</Text>
-          <Text dimColor>{`  ·  ${plural(p.sessionSteps, 'step')}${crew}`}</Text>
+          <Text>{doingText}</Text>
+          <Text dimColor>{tail}</Text>
         </Text>
-        {meters(p).length > 0 && (
+        {shown.length > 0 && (
           <Box flexDirection="row" gap={3}>
-            {meters(p).map(m => {
-              const g = bar(m.pct / 100, 10)
+            {shown.map(m => {
+              // the spend limit with its dollars: what's left (or over), no bar
+              const l = m.spend ? spendLeft(m.spend) : null
+              if (l) {
+                return (
+                  <Text key={m.key}>
+                    <Text dimColor>{m.label} </Text>
+                    <Text bold color={m.pct >= WARN ? levelColor(m.pct) : undefined}>
+                      {l.text}
+                    </Text>
+                    <Text dimColor>{` ${l.title.toLowerCase()} `}</Text>
+                    <Text bold color={m.pct >= WARN ? levelColor(m.pct) : undefined}>
+                      {levelText(m.pct)}
+                    </Text>
+                    {m.left !== null && <Text dimColor>{paceText(m)}</Text>}
+                  </Text>
+                )
+              }
+              const g = bar(m.pct / 100, BAND_BAR)
               return (
                 <Text key={m.key}>
                   <Text dimColor>{m.label} </Text>
@@ -1683,8 +1840,8 @@ export const register: Register = (on, options) => {
                     {' '}
                     {Math.round(m.pct)}%
                   </Text>
-                  {m.pct >= WARN && <Text color={levelColor(m.pct)}> {m.pct >= DANGER ? '⛔' : '⚠'}</Text>}
-                  {m.left !== null && <Text dimColor>{` · ${leftText(m.left)}`}</Text>}
+                  {m.pct >= WARN && <Text color={levelColor(m.pct)}> {glyph(m.pct)}</Text>}
+                  {m.left !== null && <Text dimColor>{paceText(m)}</Text>}
                 </Text>
               )
             })}
@@ -1724,26 +1881,40 @@ export const register: Register = (on, options) => {
     const m = main(p)
     const rows = helperRows(p)
     const more = earlierLine(p)
-    const badge = cfg.showAccount && p.account ? badgeOf(p.account, cfg) : null
+    const badge = badgeFor(p, cfg)
+    // the dim private-mode hint after a shown email, only when all of it fits on the badge's line
+    const hint = !!badge?.hasEmail && badge.text.length + 1 + HINT.length <= width
+    const name = nameShown(p, cfg)
     const lvl = p.budget === null ? 0 : budgetLevel(p.sessionCost, p.budget)
+    // what's left of the spend limit gets its own tile, when the panel is wide enough for four
+    const left = p.spend && width >= 48 ? spendLeft(p.spend) : null
 
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
-          {badge && (
+          {badge && !hint && (
             <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
               {fit(badge.text, width)}
             </Text>
           )}
-          {p.name ? <Text bold>{fit(p.name, width)}</Text> : null}
+          {badge && hint && (
+            <Text>
+              <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+                {badge.text}
+              </Text>
+              <Text dimColor>{` ${HINT}`}</Text>
+            </Text>
+          )}
+          {name ? <Text bold>{fit(name, width)}</Text> : null}
           <Box flexDirection="row" gap={1}>
             {p.budget === null
               ? tile('cost', 'Cost', money(totalCost(p)), AMBER)
               : tile('cost', 'Cost', budgetText(p), budgetColor(lvl), { fraction: p.sessionCost / p.budget, color: budgetColor(lvl) })}
             {tile('tokens', 'Tokens', k(p.sessionTokens))}
             {tile('time', 'Time', sessionClock(p), p.isRunning ? ORANGE : undefined)}
+            {p.spend && left && tile('left', left.title, left.text, levelColor(p.spend.pct))}
           </Box>
-          <Text dimColor>{fit(thisRequest(p), width)}</Text>
+          {hasRequest(p) && <Text dimColor>{fit(lastRequest(p), width)}</Text>}
         </Box>
 
         <Text>
@@ -1760,22 +1931,33 @@ export const register: Register = (on, options) => {
             {meters(p).map(m => {
               const g = bar(m.pct / 100, barWidth)
               const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, p.now)}` : ''
-              const level = `${Math.round(m.pct)}%${m.pct >= WARN ? (m.pct >= DANGER ? ' ⛔' : ' ⚠') : ''}`
+              const level = levelText(m.pct)
               const pace = m.left !== null ? ` · ${leftText(m.left)} at this pace` : ''
-              // the dollars get what's left of the line after the label, the forecast and the percent
+              // the dollars get what's left of the line after the label, the forecast and the percent:
+              // "$87.60 left" (or "$3.50 over"), and "$12.40 of $100 used" on a line of its own
               const room = width - m.label.length - 2 - pace.length - level.length - 1
+              const l = m.spend ? spendLeft(m.spend) : null
+              const word = l ? ` ${l.title.toLowerCase()}` : ''
               return (
                 <Box key={`limit-${m.key}`} flexDirection="column">
                   <Box flexDirection="row" justifyContent="space-between">
                     <Text>
                       {m.label}
-                      {m.spend && room > 1 && <Text dimColor>{'  ' + fit(spendText(m.spend), room)}</Text>}
+                      {l && room >= l.text.length + word.length && (
+                        <Text>
+                          {'  '}
+                          <Text bold>{l.text}</Text>
+                          <Text dimColor>{word}</Text>
+                        </Text>
+                      )}
+                      {l && room > 1 && room < l.text.length + word.length && <Text bold>{'  ' + fit(l.text + word, room)}</Text>}
                       {pace !== '' && <Text dimColor>{pace}</Text>}
                     </Text>
                     <Text bold color={levelColor(m.pct)}>
                       {level}
                     </Text>
                   </Box>
+                  {m.spend && <Text dimColor>{fit(spendUsed(m.spend), width)}</Text>}
                   <Text>
                     <Text color={levelColor(m.pct)}>{g.filled}</Text>
                     <Text dimColor>{g.empty}</Text>

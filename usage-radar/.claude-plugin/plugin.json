@@ -1,7 +1,7 @@
 {
   "name": "usage-radar",
-  "version": "2.3.0",
-  "description": "Live usage for Claude Code: your spend limit in dollars, plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, an Agents panel (/radar), a burn-rate forecast for limits, a session budget (/radar budget) and an account badge.",
+  "version": "2.4.0",
+  "description": "Live usage for Claude Code: your spend limit in dollars, plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, an Agents panel (/radar), a burn-rate forecast for limits, a session budget (/radar budget) and an account badge with a private mode (/radar private).",
   "types": "./types/index.d.ts",
   "author": { "name": "Tejas Shah" },
   "license": "MIT",
@@ -24,11 +24,17 @@
       "description": "Read your spend limit in dollars from Anthropic with Claude Code's own login, once a minute, and show it first in the limits. Off: no request is made.",
       "default": true
     },
-    "hideEmail": {
+    "showEmail": {
       "type": "boolean",
-      "title": "Hide email",
-      "description": "Show only the account's label (or organization), not the email address.",
-      "default": false
+      "title": "Show email",
+      "description": "Show the email next to the account label (/radar private hides it until /radar private off)",
+      "default": true
+    },
+    "showName": {
+      "type": "boolean",
+      "title": "Show session name",
+      "description": "Show the session name (from your first prompt or /rename). /radar private hides it (until /radar private off)",
+      "default": true
     },
     "defaultBudget": {
       "type": "number",
