@@ -13,7 +13,13 @@ sits above the prompt and shows model, tokens, cost, a live timer, context, your
 
 [more in the usage-radar README](usage-radar/README.md)
 
-**turn-receipt** prints a receipt when a job is done. agents, tools, slowest step, biggest read, files changed, cache hits, total cost. `/receipt` shows it, `/receipt copy` copies it as text.
+**[turn-receipt](turn-receipt/)**
+
+![turn-receipt receipt](turn-receipt/docs/receipt.png)
+
+prints a receipt when a job is done. agents, tools, slowest step, biggest read, files changed, cache hits, total cost. `/receipt` shows it, `/receipt copy` copies it as text.
+
+[more in the turn-receipt README](turn-receipt/README.md)
 
 radar is the live view, receipt is the summary after.
 
