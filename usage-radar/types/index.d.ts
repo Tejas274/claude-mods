@@ -52,6 +52,9 @@ export type NameKind = 'rename' | 'ticket' | 'words'
 /** The signed-in account, read once from the config file (not saved) */
 export type Account = { email: string | null; org: string | null; configDir: string }
 
+/** The account's dollar spend limit, from Anthropic's usage endpoint (major units; never saved) */
+export type Spend = { used: number; cap: number; currency: string; pct: number }
+
 /** One forecast sample: working time (ms) and the % that rose while working, up to then */
 export type Sample = { at: number; rise: number }
 
@@ -86,7 +89,7 @@ export type Saved = {
  * helper agent are done; job fields (steps, costUsd/baseCost, jobTokens, startedAt) start
  * over each job. Session fields (sessionId, name, sessionCost, sessionTokens, priorMs,
  * sessionSteps, helperIds, agents, earlier) add up over the whole session and are saved,
- * with the budget (budget, budgetFired). Pace and account live only in memory.
+ * with the budget (budget, budgetFired). Pace, account and spend live only in memory.
  */
 export type Live = {
   isRunning: boolean
@@ -136,6 +139,8 @@ export type Live = {
   pace: Pace
   /** the signed-in account, read once per process (null until read; not saved) */
   account: Account | null
+  /** the account's spend limit in dollars, read from Anthropic once a minute (null: none; not saved) */
+  spend: Spend | null
 }
 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }

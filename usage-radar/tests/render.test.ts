@@ -12,6 +12,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const clock = mock.clock(on)
     mock.store(on)
     on('session.id', () => ({ value: 's1' }) as never)
+    on('session.authorize', () => ({ value: null }) as never)
     let nextUsage: unknown = null
     let cost = 0
     let fiveHour = 40
@@ -130,7 +131,32 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     reads: 0,
     /** the panes open now (by id) */
     panes: new Set<string>(),
+    /** the login session.authorize answers (null: none, 'throw': it fails), and how often it was asked */
+    auth: null as null | 'throw' | { handle: string; kind: 'bearer' | 'api-key' },
+    authorized: 0,
+    /** where the session draws (none: a -p run, or an SDK session nothing attached to yet) */
+    surfaces: ['terminal'] as string[],
+    /** the requests $.http.fetch got and when, what it answers (null or 'deny': refused), and what it waits for first */
+    fetches: [] as any[],
+    fetchedAt: [] as number[],
+    reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string },
+    hold: null as null | Promise<void>,
   }
+  on('session.authorize', () => {
+    w.authorized++
+    if (w.auth === 'throw') throw new Error('no login')
+    return { value: w.auth } as never
+  })
+  on('session.surfaces', () => ({ value: w.surfaces }) as never)
+  on('http.fetch', async (_$: any, e: any) => {
+    w.fetches.push(e)
+    w.fetchedAt.push(w.clock.now())
+    const reply = w.reply
+    if (w.hold) await w.hold
+    if (reply === 'throw') throw new Error('network down')
+    if (reply === null || reply === 'deny') return { deny: 'refused' } as never
+    return { value: { ...reply, headers: {} } } as never
+  })
   mock.env(on, env)
   on('fs.read', (_$: any, e: any) => {
     w.reads++
@@ -1337,4 +1363,512 @@ test('an open panel resizes when the budget bar comes and goes', async ($, on) =
   await radarCmd($, 'budget off')
   expect(w.opened.length).toBe(opened + 2)
   await sized()
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.3.0: the spend limit in dollars, read from Anthropic once a minute
+// ════════════════════════════════════════════════════════════════════════════
+const SPEND_URL = 'https://api.anthropic.com/api/oauth/usage'
+
+// Anthropic's usage answer for an account with a spend limit: amounts in cents
+const SPEND = (used: number, cap: number) => ({
+  five_hour: null,
+  seven_day: null,
+  limits: [],
+  spend: {
+    enabled: true,
+    used: { amount_minor: used, exponent: 2, currency: 'USD' },
+    limit: { amount_minor: cap, exponent: 2, currency: 'USD' },
+    percent: Math.round((used / cap) * 100),
+    severity: 'warning',
+  },
+  extra_usage: { is_enabled: true, monthly_limit: cap, used_credits: used, utilization: (used / cap) * 100, currency: 'USD', decimal_places: 2 },
+})
+const ok = (text: string) => ({ status: 200, ok: true, text })
+// a claude login, and Anthropic answering `body`
+const spendOn = (w: World, body: unknown) => {
+  w.auth = { handle: 'h', kind: 'bearer' }
+  w.reply = ok(JSON.stringify(body))
+}
+const begin = async ($: Engine, w: World) => {
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(0)
+}
+const measure = ($: Engine, limits: Array<Record<string, unknown>>) =>
+  $.session.measure({ context: { window: 200_000, percent: 10 }, rateLimits: limits, changed: ['rateLimits'] } as never)
+const seven = (pct: number) => ({ kind: 'seven_day', percentUsed: pct })
+// The band's meter labels, in order
+const labels = async ($: Engine) => {
+  const ui = await band($)
+  const found = (await ui.findAll({ type: 'Text', text: /^(Spend|5h limit|Weekly|Context) $/ })).map(t => t.text.trim())
+  await ui.unmount()
+  return found
+}
+
+test('the dollar spend limit comes first, with no reset time of its own', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /^Spend/, /\$88\.40 used · \$11\.60 left of \$100/, /88%/)
+  await hidden(pane($), /resets in/)
+  await shows(band($), /^Spend $/, /88%/)
+  await hidden(band($), /\$88/)
+  expect(w.fetches[0].url).toBe(SPEND_URL)
+  expect(w.fetches[0].init.auth).toBe('h')
+  expect(w.fetches[0].init.headers['anthropic-beta']).toBe('oauth-2025-04-20')
+})
+
+test('Spend comes before the 5h limit, Weekly and Context', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(30), seven(11)]
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  expect(await labels($)).toEqual(['Spend', '5h limit', 'Weekly', 'Context'])
+})
+
+test('the dollars and Claude Code\'s own spend_limit are one Spend row, with its reset', async ($, on) => {
+  const w = world(on)
+  const resetsAt = new Date((8 * 24 + 14) * 3600_000 + 10 * 60_000).toISOString()
+  w.limits = [{ kind: 'spend_limit', percentUsed: 87, resetsAt }]
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  const ui = await pane($)
+  expect((await ui.findAll({ type: 'Text', text: /^Spend/ })).length).toBe(1)
+  await ui.unmount()
+  await shows(pane($), /\$88\.40 used/, /88%/, /resets in 8d 14h/)
+  // 96%: from the next check, and Claude Code's own reading after it: one ⛔
+  spendOn(w, SPEND(9600, 10000))
+  await w.clock.advance(60_000)
+  await measure($, [{ kind: 'spend_limit', percentUsed: 96, resetsAt }])
+  expect(w.toasts.filter(t => /^⛔ Spend 96% used/.test(t)).length).toBe(1)
+  expect(w.toasts.filter(t => /^⛔ Spend/.test(t)).length).toBe(1)
+})
+
+test('without Claude Code\'s spend_limit, the Spend row has no reset time', async ($, on) => {
+  const w = world(on)
+  w.limits = [seven(11)]
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /^Spend/, /^Weekly/)
+  await hidden(pane($), /resets in/)
+})
+
+const NO_SPEND: Array<[string, (w: World) => void, number]> = [
+  ['no login', w => { w.auth = null }, 0],
+  ['an API key', w => { w.auth = { handle: 'h', kind: 'api-key' } }, 0],
+  ['the request is refused', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'deny' }, 1],
+  ['the request throws', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'throw' }, 1],
+  ['a 401', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = { status: 401, ok: false, text: '{"error":"unauthorized"}' } }, 1],
+  ['an answer that is not JSON', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = ok('not json') }, 1],
+  ['no spend block', w => spendOn(w, { five_hour: null, seven_day: null, spend: null, extra_usage: null }), 1],
+  ['both turned off', w => spendOn(w, { spend: { ...SPEND(1, 2).spend, enabled: false }, extra_usage: { ...SPEND(1, 2).extra_usage, is_enabled: false } }), 1],
+  ['garbage amounts', w => spendOn(w, {
+    spend: { enabled: true, used: { amount_minor: 'lots', exponent: 2 }, limit: { amount_minor: 0, exponent: 2 } },
+    extra_usage: { is_enabled: true, monthly_limit: -5, used_credits: 1, decimal_places: 99 },
+  }), 1],
+  ['authorize throws', w => { w.auth = 'throw' }, 0],
+]
+for (const [label, set, requests] of NO_SPEND) {
+  test(`no dollar row, just the plan limits: ${label}`, async ($, on) => {
+    const w = world(on)
+    w.limits = [five(30), seven(11)]
+    set(w)
+    await begin($, w)
+    await job($, w, 'go', 0.01)
+    await measure($, [five(30), seven(11)])
+    await w.clock.advance(120_000)
+    expect(w.toasts).toEqual([])
+    expect(w.authorized).toBeGreaterThan(0)
+    if (requests === 0) expect(w.fetches.length).toBe(0)
+    else expect(w.fetches.length).toBeGreaterThan(0)
+    await shows(pane($), /^5h limit/, /^Weekly/)
+    await hidden(pane($), /^Spend/, /left of/)
+    await fits($, w)
+  })
+}
+
+test('an account without a spend limit but with extra usage reads it from extra_usage', async ($, on) => {
+  const w = world(on)
+  spendOn(w, { spend: null, extra_usage: { is_enabled: true, monthly_limit: 20000, used_credits: 12000, decimal_places: 2, currency: 'USD' } })
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$120 used · \$80 left of \$200/, /^60%$/)
+})
+
+test('over the limit: how much over, and ⛔', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(10270, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$102\.70 used · \$2\.70 over \$100/, /^103% ⛔$/)
+})
+
+test('a failed check keeps the last reading; the third in a row drops it', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$88\.40/)
+  const toasts = w.toasts.length
+  w.reply = { status: 500, ok: false, text: '' }
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$88\.40/)
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$88\.40/)
+  // a good answer in between starts the count over
+  spendOn(w, SPEND(8840, 10000))
+  await w.clock.advance(60_000)
+  w.reply = { status: 500, ok: false, text: '' }
+  await w.clock.advance(60_000)
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$88\.40/)
+  // the third failure in a row
+  await w.clock.advance(60_000)
+  await hidden(pane($), /^Spend/, /\$88\.40/)
+  expect(w.toasts.length).toBe(toasts)
+})
+
+test('an answer without a spend limit drops the last reading at once', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$88\.40/)
+  spendOn(w, { spend: null, extra_usage: null })
+  await w.clock.advance(60_000)
+  await hidden(pane($), /^Spend/, /\$88\.40/)
+})
+
+test('the spend limit is read once a minute, also while idle', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  expect(w.fetches.length).toBe(1)
+  await prompt($, 'go')
+  await start($, 'm')
+  for (let i = 0; i < 3; i++) await measure($, [])
+  await complete($, 'm')
+  await w.clock.advance(59_000)
+  expect(w.fetches.length).toBe(1)
+  await w.clock.advance(1_000)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(180_000)
+  expect(w.fetches.length).toBe(5)
+})
+
+test('an event check off the minute grid moves the next one: never two within a minute', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+  // a second after the tick: too soon
+  await w.clock.advance(1_000)
+  await measure($, [])
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(2)
+  // 56 s after the tick an event checks, off the minute grid
+  await w.clock.advance(55_000)
+  await measure($, [])
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(3)
+  // so the tick 4 s later is skipped, and the one after checks
+  await w.clock.advance(4_000)
+  expect(w.fetches.length).toBe(3)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(4)
+})
+
+test('a busy session still checks about once a minute, never twice within 55 s', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await prompt($, 'go')
+  await start($, 'm')
+  for (let t = 0; t < 6 * 60_000; t += 7_000) {
+    await w.clock.advance(7_000)
+    await measure($, [])
+    if (t % 21_000 === 0) await prompt($, 'more')
+  }
+  await w.clock.advance(0)
+  const gaps = w.fetchedAt.slice(1).map((at, i) => at - (w.fetchedAt[i] ?? 0))
+  expect(Math.min(...gaps)).toBeGreaterThanOrEqual(55_000)
+  expect(w.fetches.length).toBeGreaterThanOrEqual(6)
+})
+
+test('a tick a few seconds early after an off-grid check still checks every minute', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  w.surfaces = []
+  await begin($, w)
+  // the first check happens 3 s in, so each tick lands 3 s "early" against it
+  w.surfaces = ['terminal']
+  await w.clock.advance(3_000)
+  await measure($, [])
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  await w.clock.advance(57_000)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(3)
+})
+
+test('a check that never answers stops holding the next one back after 5 minutes', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  w.hold = new Promise(() => {})
+  await begin($, w)
+  w.hold = null
+  await w.clock.advance(240_000)
+  expect(w.fetches.length).toBe(1)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+  await shows(pane($), /\$88\.40/)
+})
+
+test('a late answer of an older check does not overwrite a newer reading', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  await begin($, w)
+  w.hold = null
+  // 5 minutes on, a new check reads $20
+  spendOn(w, SPEND(2000, 10000))
+  await w.clock.advance(300_000)
+  await shows(pane($), /\$20 used/)
+  // the stuck one's $88.40 lands now: dropped
+  land()
+  await w.clock.advance(0)
+  await shows(pane($), /\$20 used/)
+  await hidden(pane($), /\$88\.40/)
+})
+
+test('a -p run makes no request', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  w.surfaces = []
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+  await job($, w, 'go', 0.01)
+  await measure($, [])
+  await w.clock.advance(120_000)
+  expect(w.authorized).toBe(0)
+  expect(w.fetches.length).toBe(0)
+})
+
+test('an SDK session reads the spend limit once a client attaches', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  w.surfaces = []
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+  await job($, w, 'go', 0.01)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(0)
+  // a client attaches: the next tick reads it
+  w.surfaces = ['desktop']
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(1)
+  await shows(pane($), /\$88\.40 used/)
+})
+
+test('another currency and exponent', async ($, on) => {
+  const w = world(on)
+  spendOn(w, {
+    spend: {
+      enabled: true,
+      used: { amount_minor: 88, exponent: 0, currency: 'EUR' },
+      limit: { amount_minor: 100, exponent: 0, currency: 'EUR' },
+    },
+    extra_usage: null,
+  })
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /88 EUR used · 12 EUR left of 100 EUR/, /^88% ⚠$/)
+})
+
+test('the Spend row with a forecast still fits on one line', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  const engine = (pct: number) => ({ kind: 'spend_limit', percentUsed: pct, resetsAt: new Date(3 * 3600_000).toISOString() })
+  w.limits = [engine(40)]
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await prompt($, 'go')
+  await start($, 'm')
+  await climb(w, 40, 1, 180, engine)
+  await w.clock.advance(10_000)
+  const ui = await pane($)
+  const line = await ui.find({ type: 'Text', text: /^Spend/ })
+  const level = await ui.find({ type: 'Text', text: /^88% ⚠$/ })
+  expect(line?.text).toMatch(/at this pace$/)
+  expect(line?.text).toMatch(/\$88/)
+  // the pane's width: bodyColumns 60 - 2; the label side and the percent side, one space apart
+  expect((line?.text.length ?? 99) + 1 + (level?.text.length ?? 99)).toBeLessThanOrEqual(58)
+  await ui.unmount()
+})
+
+test('an open panel shrinks when the Spend row goes', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radar($)
+  const opened = w.opened.length
+  spendOn(w, { spend: null, extra_usage: null })
+  await w.clock.advance(60_000)
+  expect(w.opened.length).toBe(opened + 1)
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+})
+
+test('the end of the session stops the checks', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  const fetches = w.fetches.length
+  await $.session.end({ sessionId: 's1', reason: 'other' } as never)
+  await w.clock.advance(300_000)
+  expect(w.fetches.length).toBe(fetches)
+})
+
+test('showSpend off: no request at all', { options: { showSpend: false } }, async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await w.clock.advance(120_000)
+  expect(w.authorized).toBe(0)
+  expect(w.fetches.length).toBe(0)
+  await hidden(pane($), /left of/)
+})
+
+test('a personal account: no Spend row, the 5h and weekly limits as before', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(30), seven(11)]
+  spendOn(w, {
+    five_hour: { utilization: 30, resets_at: new Date(3 * 3600_000).toISOString() },
+    seven_day: { utilization: 11, resets_at: null },
+    spend: null,
+    extra_usage: { is_enabled: false, monthly_limit: null, used_credits: null, utilization: null },
+  })
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  expect(await labels($)).toEqual(['5h limit', 'Weekly', 'Context'])
+  await hidden(pane($), /^Spend/)
+  await fits($, w)
+})
+
+test('an open panel grows when the Spend row first appears', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radar($)
+  const opened = w.opened.length
+  spendOn(w, SPEND(8840, 10000))
+  await w.clock.advance(60_000)
+  expect(w.opened.length).toBe(opened + 1)
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
+  await ui.unmount()
+})
+
+test('the dollars are never saved', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$88\.40/)
+  const saved = JSON.stringify([...w.store.entries()])
+  expect(saved).not.toContain('88.4')
+  expect(saved).not.toContain('spend')
+})
+
+test('Spend past 80% warns once', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8100, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  expect(w.toasts.filter(t => /Spend/.test(t))).toEqual(['⚠ Spend 81% used'])
+  await w.clock.advance(60_000)
+  await measure($, [{ kind: 'spend_limit', percentUsed: 82 }])
+  expect(w.toasts.filter(t => /Spend/.test(t))).toEqual(['⚠ Spend 81% used'])
+})
+
+// ── Another login drops the reading at once ────────────────────────────
+for (const [label, auth] of [['no claude login', null], ['an API key', { handle: 'k', kind: 'api-key' }]] as const) {
+  test(`switching to ${label} drops the Spend row at the next check`, async ($, on) => {
+    const w = world(on)
+    spendOn(w, SPEND(8840, 10000))
+    await begin($, w)
+    await job($, w, 'go', 0.01)
+    await shows(pane($), /\$88\.40/)
+    const toasts = w.toasts.length
+    w.auth = auth
+    await w.clock.advance(60_000)
+    await hidden(pane($), /^Spend/, /\$88\.40/)
+    expect(w.toasts.length).toBe(toasts)
+  })
+}
+
+test('another account drops the old dollars before the new ones come', async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$88\.40/)
+  // /login as someone else; the next check's answer is slow
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(2000, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  await w.clock.advance(60_000)
+  w.hold = null
+  await hidden(pane($), /^Spend/, /\$88\.40/)
+  land()
+  await w.clock.advance(0)
+  await shows(pane($), /\$20 used/)
+})
+
+test('an answer on its way when the account changes is dropped', async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$88\.40/)
+  // a check under the old account, slow; the old account's answer would be $40
+  spendOn(w, SPEND(4000, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  await w.clock.advance(60_000)
+  w.hold = null
+  // meanwhile, /login as someone else
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(2000, 10000))
+  land()
+  await w.clock.advance(0)
+  await hidden(pane($), /^Spend/, /\$40/, /\$88\.40/)
+  // the next tick reads the new account
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$20 used/)
+})
+
+test('asking for the login failing keeps the last reading like any failed check', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(8840, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  const toasts = w.toasts.length
+  w.auth = 'throw'
+  await w.clock.advance(60_000)
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$88\.40/)
+  await w.clock.advance(60_000)
+  await hidden(pane($), /^Spend/)
+  expect(w.toasts.length).toBe(toasts)
 })

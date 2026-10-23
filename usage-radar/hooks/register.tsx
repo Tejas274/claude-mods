@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, PromptSubmitInput, Register, Timer } from 'claude-code'
 
-import type { Account, Agent, Earlier, Limit, Live, NameKind, Pace, Saved, SavedAgent, Todo, Track } from '../types'
+import type { Account, Agent, Earlier, Limit, Live, NameKind, Pace, Saved, SavedAgent, Spend, Todo, Track } from '../types'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 1. STATE: everything the screen shows lives in one value. Writing it redraws.
@@ -36,8 +36,9 @@ const EMPTY: Live = {
   budgetFired: 0,
   pace: { wall: null, active: 0, kinds: {} },
   account: null,
+  spend: null,
 }
-const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v4' })
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v5' })
 
 const PANE = 'radar-agents'
 // name (1) + tiles (4) + this request (1) + summary (2) + the limits block (2 + 2 per meter, when
@@ -49,6 +50,13 @@ const PANE_COLUMNS = 64
 const ROWS = 8 // helper rows on screen; the rest share one line
 const TICK_MS = 250
 const POLL_MS = 1000 // while working, cost, limits and the engine's agent list are read this often
+
+// The spend limit in dollars: read from Anthropic with Claude Code's own login, once a minute
+const SPEND_MS = 60_000
+const SPEND_SLACK_MS = 5_000 // checks are at least SPEND_MS minus this apart, so a tick a bit early still counts
+const SPEND_URL = 'https://api.anthropic.com/api/oauth/usage'
+const SPEND_STUCK_MS = 5 * 60_000 // a reading that never answers stops blocking the next one after this
+const SPEND_MISSES = 3 // after this many failed checks in a row, the last reading is dropped
 
 // The limit forecast: how fast each limit fills while working, over the last 10 minutes of work
 const WINDOW_MS = 600_000 // pace is measured over this much working time
@@ -402,6 +410,7 @@ const freshSession = (p: Live, id: string, saved: Saved | null, ledger: number |
     alerted: p.alerted,
     pace: p.pace,
     account: p.account,
+    spend: p.spend,
     lastLedger: ledger,
     ...(saved && {
       name: saved.name,
@@ -587,6 +596,68 @@ const isoOf = (x: unknown): string | undefined => {
   return typeof x === 'string' && Number.isFinite(Date.parse(x)) ? x : undefined
 }
 
+// ── The spend limit in dollars (Anthropic's usage endpoint) ─────────────
+// Only the numbers are kept; anything odd counts as no spend limit. Never throws.
+const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const fin = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
+// how many decimals an amount in minor units has (0 to 6), else null
+const exp = (x: unknown): number | null => (Number.isInteger(x) && (x as number) >= 0 && (x as number) <= 6 ? (x as number) : null)
+// { amount_minor: 8840, exponent: 2 } → 88.4
+const amount = (m: unknown): number | null => {
+  if (!isObj(m) || !fin(m.amount_minor)) return null
+  const e = exp(m.exponent)
+  return e === null ? null : m.amount_minor / 10 ** e
+}
+const cur = (x: unknown): string => (typeof x === 'string' && /^[A-Z]{3}$/.test(x) ? x : 'USD')
+// A spend limit from its two amounts: a cap above 0, and nothing used below 0
+const validSpend = (used: number | null, cap: number | null, currency: string): Spend | null =>
+  used !== null && cap !== null && cap > 0 && used >= 0 ? { used, cap, currency, pct: (used / cap) * 100 } : null
+
+// The answer's spend limit: its `spend` block, else `extra_usage`; null when it has none
+const spendOf = (o: Record<string, unknown>): Spend | null => {
+  const s = o.spend
+  if (isObj(s) && s.enabled === true) {
+    const limit = isObj(s.limit) ? s.limit : {}
+    const used = isObj(s.used) ? s.used : {}
+    const found = validSpend(amount(s.used), amount(s.limit), cur(limit.currency ?? used.currency))
+    if (found) return found
+  }
+  const x = o.extra_usage
+  if (isObj(x) && x.is_enabled === true) {
+    const d = exp(x.decimal_places)
+    if (d !== null && fin(x.used_credits) && fin(x.monthly_limit)) {
+      const found = validSpend(x.used_credits / 10 ** d, x.monthly_limit / 10 ** d, cur(x.currency))
+      if (found) return found
+    }
+  }
+  return null
+}
+
+// The answer's text as a JSON object, or null when it isn't one
+const jsonObject = (text: string): Record<string, unknown> | null => {
+  try {
+    const o: unknown = JSON.parse(text)
+    return isObj(o) ? o : null
+  } catch {
+    return null
+  }
+}
+
+// 88.404 → "$88.40", 100 → "$100"; another currency: "88.40 EUR"
+const cash = (n: number, currency: string): string => {
+  const c = Math.round(n * 100) / 100
+  const text = Number.isInteger(c) ? `${c}` : c.toFixed(2)
+  return currency === 'USD' ? `$${text}` : `${text} ${currency}`
+}
+
+// "$88.40 used · $11.60 left of $100", or "$102.70 used · $2.70 over $100"
+const spendText = (s: Spend): string => {
+  const left = s.cap - s.used
+  return left >= 0
+    ? `${cash(s.used, s.currency)} used · ${cash(left, s.currency)} left of ${cash(s.cap, s.currency)}`
+    : `${cash(s.used, s.currency)} used · ${cash(-left, s.currency)} over ${cash(s.cap, s.currency)}`
+}
+
 // ── The forecast: when a limit runs out at the pace it fills while working ──
 // The clock here is working time: a gap of over a minute between two readings, time while
 // the job stands idle, or the gap before a job (wall null), adds nothing, and what a limit
@@ -636,18 +707,47 @@ const forecastMs = (p: Live, l: Limit): number | null => {
 // "~1h 10m left" (never under a minute)
 const leftText = (ms: number): string => `~${duration(Math.max(60_000, ms))} left`
 
-// Every meter we watch: plan limits first, then context. `left`: the forecast, for limits
-type Meter = { key: string; label: string; pct: number; resetsAt?: string; left: number | null }
-const meters = (p: Live): Meter[] => [
-  ...p.limits.map(l => ({
-    key: l.kind,
-    label: limitLabel(l.kind),
-    pct: l.percentUsed,
-    resetsAt: l.resetsAt,
-    left: forecastMs(p, l),
-  })),
-  ...(p.contextPct === null ? [] : [{ key: 'context', label: 'Context', pct: p.contextPct, left: null }]),
-]
+// Every meter we watch: the spend limit first, then the plan limits, then context.
+// `left`: the forecast, for limits; `spend`: the dollars, when Anthropic told us them
+type Meter = { key: string; label: string; pct: number; resetsAt?: string; left: number | null; spend?: Spend }
+const limitMeter = (p: Live, l: Limit): Meter => ({
+  key: l.kind,
+  label: limitLabel(l.kind),
+  pct: l.percentUsed,
+  resetsAt: l.resetsAt,
+  left: forecastMs(p, l),
+})
+// The spend limit is one meter: Anthropic's dollars (and percent) win, the reset time and the
+// forecast come from Claude Code's own spend_limit, when it reports one
+const meters = (p: Live): Meter[] => {
+  const engine = p.limits.find(l => l.kind === 'spend_limit')
+  const spend: Meter[] = p.spend
+    ? [{ key: 'spend_limit', label: 'Spend', pct: p.spend.pct, resetsAt: engine?.resetsAt, left: engine ? forecastMs(p, engine) : null, spend: p.spend }]
+    : engine
+      ? [limitMeter(p, engine)]
+      : []
+  return [
+    ...spend,
+    ...p.limits.filter(l => l.kind !== 'spend_limit').map(l => limitMeter(p, l)),
+    ...(p.contextPct === null ? [] : [{ key: 'context', label: 'Context', pct: p.contextPct, left: null }]),
+  ]
+}
+
+// Which meters crossed 80% or 95% since the last reading: one alert per level
+const meterAlerts = (next: Live, alerted: Record<string, number>, now: number): { alerted: Record<string, number>; alerts: string[] } => {
+  const out = { ...alerted }
+  const alerts: string[] = []
+  for (const m of meters(next)) {
+    const level = m.pct >= DANGER ? DANGER : m.pct >= WARN ? WARN : 0
+    if (level > (out[m.key] ?? 0)) {
+      const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, now)}` : ''
+      const tip = m.key === 'context' ? ' · run /compact soon' : ''
+      alerts.push(`${level >= DANGER ? '⛔' : '⚠'} ${m.label} ${Math.round(m.pct)}% used${reset}${tip}`)
+    }
+    out[m.key] = level // drops back to 0 after a reset or /compact, so it can alert again
+  }
+  return { alerted: out, alerts }
+}
 
 // Save the latest limits and context, and work out which alerts to pop (each once per level).
 // Every reading also feeds the forecast, and checks the budget.
@@ -667,17 +767,7 @@ const withUsage = (
     contextPct: contextPct ?? p.contextPct,
     pace: withPace(p, fresh, now),
   }
-  const alerted = { ...p.alerted }
-  const alerts: string[] = []
-  for (const m of meters(next)) {
-    const level = m.pct >= DANGER ? DANGER : m.pct >= WARN ? WARN : 0
-    if (level > (alerted[m.key] ?? 0)) {
-      const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, p.now)}` : ''
-      const tip = m.key === 'context' ? ' · run /compact soon' : ''
-      alerts.push(`${level >= DANGER ? '⛔' : '⚠'} ${m.label} ${Math.round(m.pct)}% used${reset}${tip}`)
-    }
-    alerted[m.key] = level // drops back to 0 after a reset or /compact, so it can alert again
-  }
+  const { alerted, alerts } = meterAlerts(next, p.alerted, p.now)
   // the forecast: ⚠ under 30 minutes, ⛔ under 10, each once; again after a reset, or once it's
   // gone or an hour away while working (an idle job keeps what was shown)
   for (const l of isIdle(next) ? [] : next.limits) {
@@ -735,6 +825,7 @@ type Config = {
   showAccount: boolean
   hideEmail: boolean
   defaultBudget: number | null
+  showSpend: boolean
 }
 const configOf = (o: PluginOptions): Config => {
   const raw = o.accounts
@@ -750,6 +841,7 @@ const configOf = (o: PluginOptions): Config => {
     showAccount: o.showAccount !== false,
     hideEmail: o.hideEmail === true,
     defaultBudget: typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? budget : null,
+    showSpend: o.showSpend !== false,
   }
 }
 
@@ -928,6 +1020,141 @@ const detectAccount = async ($: EngineInterface): Promise<Account> => {
   return { ...found, configDir: dir ? shortDir(dir, home) : '~/.claude' }
 }
 
+// An open panel takes its new height (a meter or the budget bar came or went); a closed one is
+// sized when it opens
+const resizeIfOpen = async ($: EngineInterface, p: Live, showAccount: boolean): Promise<void> => {
+  try {
+    if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
+      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, meters(p).length, showAccount), columns: PANE_COLUMNS })
+    }
+  } catch {
+    // ignore: the next open sizes it
+  }
+}
+
+// ── The spend limit, read from Anthropic once a minute (also while idle) ──
+let spendTimer: Timer | undefined
+let spendAt: number | null = null // when the last check started, so checks stay a minute apart
+let spendBusyAt: number | null = null // a check on its way since then (null: none)
+let spendCheck = 0 // which check is the latest, so a late answer of an older one is dropped
+let spendMisses = 0 // failed checks in a row; the last reading is kept until SPEND_MISSES
+
+// The session's login: a claude login's handle, 'none' (an API key, Bedrock, Vertex, a gateway,
+// no login: there's no spend limit to read) or 'fail' (asking failed: try again later). Never throws.
+const loginOf = async ($: EngineInterface): Promise<{ handle: string } | 'none' | 'fail'> => {
+  try {
+    const auth = await $.session.authorize()
+    return auth && auth.kind === 'bearer' ? { handle: auth.handle } : 'none'
+  } catch {
+    return 'fail'
+  }
+}
+
+// One request with that login. `ok: false` when it failed (refused, an error, an odd answer);
+// `ok: true` when Anthropic answered, with spend null when the account has no spend limit.
+// Only the numbers are kept, nothing is logged. Never throws.
+const fetchSpend = async ($: EngineInterface, handle: string): Promise<{ ok: true; spend: Spend | null } | { ok: false }> => {
+  try {
+    const r = await $.http.fetch(SPEND_URL, { auth: handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+    if (!r.ok) return { ok: false }
+    const o = jsonObject(r.text)
+    return o ? { ok: true, spend: spendOf(o) } : { ok: false }
+  } catch {
+    return { ok: false }
+  }
+}
+
+const sameSpend = (a: Spend | null, b: Spend | null): boolean =>
+  a === b || (a !== null && b !== null && a.used === b.used && a.cap === b.cap && a.currency === b.currency)
+
+// Another account than `was`: both name someone (email or organization) and it's someone else.
+// A file that names nobody, or can't be read, says nothing.
+const named = (a: Account | null): a is Account => a !== null && (a.email !== null || a.org !== null)
+const switched = (was: Account | null, now: Account): boolean =>
+  named(was) && named(now) && (now.email !== was.email || now.org !== was.org)
+
+// Put a reading (or none) on screen, with its alerts; `account`: the login changed to this one
+const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, account?: Account): Promise<void> => {
+  const before = await read($, live)
+  let alerts: string[] = []
+  const after = await update($, live, p => {
+    // update may run this more than once: only the last run's outcome counts
+    alerts = []
+    const base = account ? { ...p, account } : p
+    if (sameSpend(p.spend, spend)) return base
+    const q: Live = { ...base, spend }
+    const r = meterAlerts(q, p.alerted, p.now)
+    alerts = r.alerts
+    return { ...q, alerted: r.alerted }
+  })
+  for (const a of alerts) $.ui.toast(a)
+  if (after !== before) $.ui.status(statusLine(after))
+  // the Spend row came or went: an open panel takes its new height
+  if (meters(before).length !== meters(after).length) await resizeIfOpen($, after, cfg.showAccount)
+}
+
+// Read the spend limit, at most once a minute (from the minute timer, or an event: start, a prompt,
+// a measure) and one check at a time. Nothing drawn (a -p run, an SDK session no client attached
+// to yet): no request. A failed check keeps the last reading; the third in a row drops it. An
+// answer without a spend limit, or another login (no claude login, another account), drops it at once.
+const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
+  if (!cfg.showSpend) return
+  let now: number | null = null
+  try {
+    if ((await $.session.surfaces()).length === 0) return
+    now = await $.clock.now()
+    if (spendBusyAt !== null && now - spendBusyAt < SPEND_STUCK_MS) return
+    if (spendAt !== null && now >= spendAt && now - spendAt < SPEND_MS - SPEND_SLACK_MS) return
+    spendAt = spendBusyAt = now
+    const check = ++spendCheck
+    const login = await loginOf($)
+    if (check !== spendCheck) return
+    if (login === 'none') {
+      spendMisses = 0
+      return await putSpend($, cfg, null)
+    }
+    let got: { ok: true; spend: Spend | null } | { ok: false } = { ok: false }
+    if (login !== 'fail') {
+      // another account than the one on screen: its reading goes now, before the new one comes
+      const who = await detectAccount($)
+      if (switched((await read($, live)).account, who)) {
+        spendMisses = 0
+        await putSpend($, cfg, null, who)
+      }
+      got = await fetchSpend($, login.handle)
+      // a newer check started meanwhile (this one was stuck): its answer counts, not this one
+      if (check !== spendCheck) return
+      // the account changed while this one was on its way: its answer is the old account's
+      const after = await detectAccount($)
+      if (switched(who, after)) {
+        spendMisses = 0
+        spendAt = null // the next tick or event checks the new account right away
+        return await putSpend($, cfg, null, after)
+      }
+    }
+    spendMisses = got.ok ? 0 : spendMisses + 1
+    if (!got.ok && spendMisses < SPEND_MISSES) return
+    await putSpend($, cfg, got.ok ? got.spend : null)
+  } catch {
+    // ignore: the next check tries again
+  } finally {
+    if (now !== null && spendBusyAt === now) spendBusyAt = null
+  }
+}
+
+const stopSpend = () => {
+  spendTimer?.cancel()
+  spendTimer = undefined
+}
+
+// Check now, then once a minute
+const startSpend = ($: EngineInterface, cfg: Config) => {
+  if (!cfg.showSpend) return
+  stopSpend()
+  spendTimer = $.clock.every(SPEND_MS, () => void refreshSpend($, cfg))
+  void refreshSpend($, cfg)
+}
+
 // Which session are we in? On a new id (start, --resume, /clear) save the old one and
 // load the new one's totals, or start them at zero.
 const syncSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
@@ -1084,6 +1311,7 @@ export const register: Register = (on, options) => {
   // ── Startup: pick up this session's totals, add the /radar command ─────
   on('session.start', async ($, e, next) => {
     await syncSession($, cfg)
+    startSpend($, cfg)
     await $.command.register({ name: 'radar', description: 'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session' })
     return next(e)
   })
@@ -1091,6 +1319,7 @@ export const register: Register = (on, options) => {
   // ── The session ends (exit, /clear, ...): save its totals, stop the clock ─
   on('session.end', async ($, e, next) => {
     stopTicker()
+    stopSpend()
     await save($)
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -1156,15 +1385,7 @@ export const register: Register = (on, options) => {
     const p = await update($, live, q => withBudgetSet(q, arg === 'off' ? null : arg))
     await save($)
     // the budget bar came or went under the cost tile: an open panel takes its new height
-    if ((before === null) !== (p.budget === null)) {
-      try {
-        if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
-          await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, meters(p).length, cfg.showAccount), columns: PANE_COLUMNS })
-        }
-      } catch {
-        // ignore: the next open sizes it
-      }
-    }
+    if ((before === null) !== (p.budget === null)) await resizeIfOpen($, p, cfg.showAccount)
     if (arg === 'off') return { text: 'Budget off for this session.' }
     const past = p.budgetFired > 0 ? ` · already past ${p.budgetFired}%` : ''
     return { text: `Budget set: ${dollars(arg)} for this session · ${money(totalCost(p))} spent so far${past}` }
@@ -1173,6 +1394,9 @@ export const register: Register = (on, options) => {
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
     await syncSession($, cfg)
+    // the spend limit: checked now (at most once a minute), and from here on if it wasn't yet
+    if (!spendTimer) startSpend($, cfg)
+    else void refreshSpend($, cfg)
     // the first prompt you type names the session (unless it has a name already)
     if (!(await read($, live)).name) {
       const n = await nameFrom($, e)
@@ -1355,6 +1579,7 @@ export const register: Register = (on, options) => {
       })
       $.ui.status(statusLine(p))
       for (const a of alerts) $.ui.toast(a)
+      void refreshSpend($, cfg)
     } catch {
       // ignore: the next reading catches up
     }
@@ -1535,15 +1760,20 @@ export const register: Register = (on, options) => {
             {meters(p).map(m => {
               const g = bar(m.pct / 100, barWidth)
               const reset = m.resetsAt ? ` · resets in ${until(m.resetsAt, p.now)}` : ''
+              const level = `${Math.round(m.pct)}%${m.pct >= WARN ? (m.pct >= DANGER ? ' ⛔' : ' ⚠') : ''}`
+              const pace = m.left !== null ? ` · ${leftText(m.left)} at this pace` : ''
+              // the dollars get what's left of the line after the label, the forecast and the percent
+              const room = width - m.label.length - 2 - pace.length - level.length - 1
               return (
                 <Box key={`limit-${m.key}`} flexDirection="column">
                   <Box flexDirection="row" justifyContent="space-between">
                     <Text>
                       {m.label}
-                      {m.left !== null && <Text dimColor>{` · ${leftText(m.left)} at this pace`}</Text>}
+                      {m.spend && room > 1 && <Text dimColor>{'  ' + fit(spendText(m.spend), room)}</Text>}
+                      {pace !== '' && <Text dimColor>{pace}</Text>}
                     </Text>
                     <Text bold color={levelColor(m.pct)}>
-                      {Math.round(m.pct)}%{m.pct >= WARN ? (m.pct >= DANGER ? ' ⛔' : ' ⚠') : ''}
+                      {level}
                     </Text>
                   </Box>
                   <Text>
