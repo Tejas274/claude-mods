@@ -137,6 +137,8 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     authorized: 0,
     /** where the session draws (none: a -p run, or an SDK session nothing attached to yet) */
     surfaces: ['terminal'] as string[],
+    /** how often session.surfaces was asked (each spend check asks once) */
+    surfaced: 0,
     /** the requests $.http.fetch got and when, what it answers (null or 'deny': refused), and what it waits for first */
     fetches: [] as any[],
     fetchedAt: [] as number[],
@@ -150,7 +152,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     if (w.auth === 'throw') throw new Error('no login')
     return { value: w.auth } as never
   })
-  on('session.surfaces', () => ({ value: w.surfaces }) as never)
+  on('session.surfaces', () => { w.surfaced++; return { value: w.surfaces } as never })
   on('http.fetch', async (_$: any, e: any) => {
     w.fetches.push(e)
     w.fetchedAt.push(w.clock.now())
@@ -1771,6 +1773,126 @@ test('the end of the session stops the checks', async ($, on) => {
   await $.session.end({ sessionId: 's1', reason: 'other' } as never)
   await w.clock.advance(300_000)
   expect(w.fetches.length).toBe(fetches)
+})
+
+// ── 2.4.1: started once from whichever comes first (a plugin above may skip session.start) ──
+const workSpend = (on: any) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com', 'Work Co')
+  spendOn(w, SPEND(1240, 10000))
+  return w
+}
+
+test('without session.start or classic.SessionStart, the first prompt starts the account and the spend check, once', { options: LABELS }, async ($, on) => {
+  const w = workSpend(on)
+  await prompt($, 'go')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  // no turn yet, so no band: the panel shows the badge
+  await shows(pane($), /\$12\.40 of \$100 used/, exactly('[WORK] you@work.example.com'))
+  await prompt($, 'more')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  // one timer: one check a minute
+  const s = w.surfaced
+  await w.clock.advance(60_000)
+  expect(w.surfaced - s).toBe(1)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(3)
+})
+
+test("without session.start, the main agent's first turn starts them", { options: LABELS }, async ($, on) => {
+  const w = workSpend(on)
+  await start($, 'm')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  await shows(pane($), /\$12\.40 of \$100 used/)
+  await shows(band($), exactly('[WORK] you@work.example.com'))
+  // a helper's turn and the next main turn don't start them again
+  await start($, 'h1', 'a1')
+  await start($, 'm2')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  const s = w.surfaced
+  await w.clock.advance(60_000)
+  expect(w.surfaced - s).toBe(1)
+  expect(w.fetches.length).toBe(2)
+})
+
+test('with session.start, a prompt and a turn still run one timer', { options: LABELS }, async ($, on) => {
+  const w = workSpend(on)
+  await begin($, w)
+  await prompt($, 'go')
+  await start($, 'm')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  const s = w.surfaced
+  await w.clock.advance(60_000)
+  expect(w.surfaced - s).toBe(1)
+  expect(w.fetches.length).toBe(2)
+})
+
+test('the account file is read once when only turns come', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+  await start($, 'm')
+  await complete($, 'm')
+  await start($, 'm2')
+  expect(w.reads).toBe(1)
+  await shows(band($), exactly('[PERSONAL] you@gmail.com'))
+})
+
+test('private mode is loaded even without session.start', { options: LABELS }, async ($, on) => {
+  const w = world(on, { private: true }, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@gmail.com')
+  await job($, w, 'go', 0.01)
+  await shows(band($), exactly('[PERSONAL]'))
+  await hidden(band($), /gmail/)
+  await hidden(pane($), /gmail/)
+})
+
+test('session.end lets the next session start again', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await prompt($, 'go')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(1)
+  await $.session.end({ sessionId: 's1', reason: 'other' } as never)
+  await w.clock.advance(120_000)
+  expect(w.fetches.length).toBe(1)
+  // /clear: a new session, and no session.start again
+  w.sid = 's2'
+  await prompt($, 'next')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(2)
+  const s = w.surfaced
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(3)
+  expect(w.surfaced - s).toBe(1)
+})
+
+test('showSpend off without session.start: no request at all', { options: { showSpend: false } }, async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await prompt($, 'go')
+  await start($, 'm')
+  await w.clock.advance(120_000)
+  expect(w.authorized).toBe(0)
+  expect(w.fetches.length).toBe(0)
+})
+
+test('an SDK session without session.start reads the spend limit once a client attaches', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  w.surfaces = []
+  await start($, 'm')
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(0)
+  w.surfaces = ['desktop']
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(1)
+  await shows(pane($), /\$12\.40 of \$100 used/)
 })
 
 test('showSpend off: no request at all', { options: { showSpend: false } }, async ($, on) => {

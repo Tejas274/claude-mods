@@ -1267,6 +1267,29 @@ const syncSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
   }
 }
 
+// ── Once per session: private mode, the account, the spend check, /radar ──
+// from whichever comes first: session.start, a prompt, or the main agent's turn (a plugin
+// above may swallow session.start). session.end lets the next session start them again
+let starting: Promise<void> | null = null
+
+const startSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
+  try {
+    await loadPrivate($) // first: a private email is never drawn
+    await syncSession($, cfg)
+    startSpend($, cfg)
+    await $.command.register({
+      name: 'radar',
+      description:
+        'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
+    })
+  } catch {
+    // ignore: a refused command leaves the rest running, a prompt re-reads the session
+  }
+}
+
+// every caller waits for the same one start
+const ensureStarted = ($: EngineInterface, cfg: Config): Promise<void> => (starting ??= startSession($, cfg))
+
 // A helper's row name, from the engine's list of agents
 const agentName = async ($: EngineInterface, agentId: string): Promise<string | undefined> => {
   try {
@@ -1394,14 +1417,7 @@ export const register: Register = (on, options) => {
 
   // ── Startup: pick up this session's totals, add the /radar command ─────
   on('session.start', async ($, e, next) => {
-    await loadPrivate($)
-    await syncSession($, cfg)
-    startSpend($, cfg)
-    await $.command.register({
-      name: 'radar',
-      description:
-        'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
-    })
+    await ensureStarted($, cfg)
     return next(e)
   })
 
@@ -1409,6 +1425,7 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     stopTicker()
     stopSpend()
+    starting = null // the next session (after /clear) starts again
     await save($)
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -1492,10 +1509,10 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     // an open panel takes the rows this prompt brings (the name, the Context meter) at once, below
     const before = await read($, live)
+    await ensureStarted($, cfg)
     await syncSession($, cfg)
-    // the spend limit: checked now (at most once a minute), and from here on if it wasn't yet
-    if (!spendTimer) startSpend($, cfg)
-    else void refreshSpend($, cfg)
+    // the spend limit: checked now too (at most once a minute)
+    void refreshSpend($, cfg)
     // the first prompt you type names the session (unless it has a name already)
     if (!(await read($, live)).name) {
       const n = await nameFrom($, e)
@@ -1540,6 +1557,7 @@ export const register: Register = (on, options) => {
 
   // ── An agent starts working (main loop or a helper) ─────────────────────
   on('turn.start', async ($, e, next) => {
+    if (!e.agentId) await ensureStarted($, cfg) // no session.start or prompt came: start here (once)
     const id = e.agentId ?? 'main'
     const now = await $.clock.now()
     const name = (e.agentId && (await agentName($, e.agentId))) || (id === 'main' ? 'Main' : 'Helper')
@@ -1568,7 +1586,7 @@ export const register: Register = (on, options) => {
     }
 
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   // ── Every model request: read its model and token usage (live) ──────────
   on('turn.step', async function* ($, e, next) {
