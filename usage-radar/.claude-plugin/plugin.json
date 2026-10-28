@@ -1,6 +1,6 @@
 {
   "name": "usage-radar",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Live usage for Claude Code: your spend limit in dollars, plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, an Agents panel (/radar), a burn-rate forecast for limits, a session budget (/radar budget) and an account badge with a private mode (/radar private).",
   "types": "./types/index.d.ts",
   "author": { "name": "Tejas Shah" },

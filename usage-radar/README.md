@@ -140,6 +140,7 @@ it reads your usage from anthropic using claude code's own login, once a minute,
 
 ### changelog
 
+- 2.4.1 the account, the spend limit, private mode and /radar start on the first prompt or turn when another plugin skips the session start, so the Spend row still shows (and a private email stays hidden)
 - 2.4.0 a tidier three-line band (no separate context bar line, meters that never wrap, a header that fits 60 columns by dropping the word `tokens`, then the time, then the model, never the cost), `last request` instead of `this request`, shown once there's a first request, what's left of the spend limit up front (`$87.60 left`, a `Left` tile in the panel), the email and the session name shown by default (`hideEmail` is replaced by `showEmail`, plus `showName`) with a dim `(/radar private to hide)` hint, `/radar private` to hide both in one step (`/radar private off` shows them again), no badge for an unlabelled account without an email (never the organization or config folder), and the open panel resizes when the session name or the meters arrive
 - 2.3.0 your real spend limit in dollars (used, left, cap) first in the limits, read from anthropic with claude code's login once a minute; `showSpend` turns it off
 - 2.2.0 burn-rate forecast for the 5h/weekly limits, session budget (/radar budget) with 80%/100% warnings, account badge with labels
