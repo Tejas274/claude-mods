@@ -130,8 +130,23 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     /** files $.fs.read finds (by path), and how many reads were asked for */
     files: {} as Record<string, string>,
     reads: 0,
-    /** the panes open now (by id) */
-    panes: new Set<string>(),
+    /** the panes open now (by id): placed (drawn) and shown (not a tab behind another) */
+    panes: new Map<string, { placed: boolean; shown: boolean }>(),
+    /** what the next ui.open answers: placed or waiting undrawn (with `reason`), shown or in a tab */
+    placed: true,
+    shown: true,
+    reason: 'waits for 144 columns (100 now)',
+    /** every ui.open's argument, every ui.close's origin, and ui.open refused */
+    openArgs: [] as any[],
+    closes: [] as string[],
+    openDeny: false,
+    /** ui.close refused */
+    closeDeny: false,
+    /** session.usage fails */
+    usageBroken: false,
+    /** command.register: how many calls fail first, and how many were asked */
+    registerFails: 0,
+    registers: 0,
     /** the login session.authorize answers (null: none, 'throw': it fails), and how often it was asked */
     auth: null as null | 'throw' | { handle: string; kind: 'bearer' | 'api-key' },
     authorized: 0,
@@ -142,7 +157,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     /** the requests $.http.fetch got and when, what it answers (null or 'deny': refused), and what it waits for first */
     fetches: [] as any[],
     fetchedAt: [] as number[],
-    reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string },
+    reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string; headers?: Record<string, string> },
     hold: null as null | Promise<void>,
     /** the store fails every get and set */
     storeBroken: false,
@@ -160,7 +175,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     if (w.hold) await w.hold
     if (reply === 'throw') throw new Error('network down')
     if (reply === null || reply === 'deny') return { deny: 'refused' } as never
-    return { value: { ...reply, headers: {} } } as never
+    return { value: { ...reply, headers: reply.headers ?? {} } } as never
   })
   mock.env(on, env)
   on('fs.read', (_$: any, e: any) => {
@@ -185,6 +200,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
   on('store.keys', () => ({ value: [...w.store.keys()] }) as never)
   on('session.id', () => ({ value: w.sid }) as never)
   on('session.usage', async () => {
+    if (w.usageBroken) throw new Error('no usage')
     const value = { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: w.limits, cost: { usd: w.cost } }
     const f = w.onUsage
     w.onUsage = null
@@ -202,14 +218,31 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return { value: w.agents } as never
   })
   on('ui.open', (_$: any, e: any) => {
+    w.openArgs.push(e)
+    if (w.openDeny) return { deny: 'no panes here' } as never
     if (typeof e.rows === 'number') w.opened.push(e.rows)
-    w.panes.add(e.id)
-    return { value: { isPlaced: true } } as never
+    w.panes.set(e.id, { placed: w.placed, shown: w.shown })
+    return { value: w.placed ? { isPlaced: true } : { isPlaced: false, reason: w.reason } } as never
   })
-  on('ui.panes', () => ({ value: [...w.panes].map(id => ({ id, title: 'Usage Radar', isShown: true, isFocused: false, isPlaced: true })) }) as never)
+  on('ui.panes', () => ({
+    value: [...w.panes].map(([id, x]) => ({ id, title: 'Usage Radar', isShown: x.shown, isFocused: false, isPlaced: x.placed })),
+  }) as never)
+  on('ui.close', (_$: any, e: any) => {
+    if (w.closeDeny) return { deny: 'not now' } as never
+    w.panes.delete(e.id)
+    w.closes.push(e.origin?.kind)
+    return { value: undefined } as never
+  })
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', (_$: any, e: any) => { w.toasts.push(e.text); return { value: undefined } as never })
-  on('command.register', () => ({ value: { command: 'radar' } }) as never)
+  on('command.register', () => {
+    w.registers++
+    if (w.registerFails > 0) {
+      w.registerFails--
+      throw new Error('refused')
+    }
+    return { value: { command: 'radar' } } as never
+  })
   on('command.run', () => ({ text: '' }) as never)
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }) as never)
   on('session.end', (_$: any, e: any) => ({ sessionId: e.sessionId }) as never)
@@ -891,7 +924,8 @@ const height = (el: any): number => {
 const radar = ($: Engine) =>
   $.command.run({ command: 'radar', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as never)
 const fits = async ($: Engine, w: World) => {
-  await radar($)
+  // /radar open, not /radar: a bare /radar closes the panel when it is open
+  await radarCmd($, 'open')
   const ui: any = await pane($)
   expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
   await ui.unmount()
@@ -1499,6 +1533,7 @@ const NO_SPEND: Array<[string, (w: World) => void, number]> = [
   ['the request is refused', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'deny' }, 1],
   ['the request throws', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'throw' }, 1],
   ['a 401', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = { status: 401, ok: false, text: '{"error":"unauthorized"}' } }, 1],
+  ['a 429', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = { status: 429, ok: false, text: '' } }, 1],
   ['an answer that is not JSON', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = ok('not json') }, 1],
   ['no spend block', w => spendOn(w, { five_hour: null, seven_day: null, spend: null, extra_usage: null }), 1],
   ['both turned off', w => spendOn(w, { spend: { ...SPEND(1, 2).spend, enabled: false }, extra_usage: { ...SPEND(1, 2).extra_usage, is_enabled: false } }), 1],
@@ -1546,14 +1581,14 @@ test('over the limit: how much over, and ⛔', async ($, on) => {
   expect(await color(pane($), exactly('$3.50'))).toBe('error')
 })
 
-test('a failed check keeps the last reading; the third in a row drops it', async ($, on) => {
+test('a refused check (401) keeps the last reading; the third in a row drops it', async ($, on) => {
   const w = world(on)
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   await shows(pane($), /\$12\.40/)
   const toasts = w.toasts.length
-  w.reply = { status: 500, ok: false, text: '' }
+  w.reply = { status: 401, ok: false, text: '' }
   await w.clock.advance(60_000)
   await shows(pane($), /\$12\.40/)
   await w.clock.advance(60_000)
@@ -1561,7 +1596,7 @@ test('a failed check keeps the last reading; the third in a row drops it', async
   // a good answer in between starts the count over
   spendOn(w, SPEND(1240, 10000))
   await w.clock.advance(60_000)
-  w.reply = { status: 500, ok: false, text: '' }
+  w.reply = { status: 401, ok: false, text: '' }
   await w.clock.advance(60_000)
   await w.clock.advance(60_000)
   await shows(pane($), /\$12\.40/)
@@ -2627,4 +2662,481 @@ test('a broken store: private mode starts off, and /radar private still hides th
   await hidden(band($, 160), /@/, /DEMO-142/)
   await hidden(pane($), /@/, /DEMO-142/)
   await shows(pane($), exactly('[WORK]'))
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.2: the panel on every terminal, the spend check backing off, helpers that end unheard
+// ════════════════════════════════════════════════════════════════════════════
+const PANE_ID = 'radar-agents'
+// The pane seated inline above the prompt with `bodyRows` rows of room
+const inlinePane = ($: Engine, bodyRows: number): Promise<Ui> => $.ui.mount({
+  plugin: 'usage-radar', surface: 'terminal', component: 'Pane', requestId: PANE_ID,
+  props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'inline', scroll: { offset: 0, bodyRows } } as never,
+})
+// The band on a terminal that says its layout
+const bandIn = ($: Engine, isFullscreen: boolean): Promise<Ui> => $.ui.mount({
+  plugin: 'usage-radar', surface: 'terminal', component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100 } as never,
+  viewport: { columns: 160, rows: 40, isFullscreen },
+} as never)
+const radarAt = ($: Engine, args: string, presentation: { isFullscreen: boolean; columns: number }) =>
+  $.command.run({ command: 'radar', args, origin: { kind: 'composer' }, presentation } as never) as Promise<{ text?: string }>
+const helper = (n: number, status = 'running') => ({ id: `a${n}`, description: `Task ${n}`, type: 'Explore', status })
+// A job with main working, then `n` helpers starting (the panel opens on its own)
+const withHelpers = async ($: Engine, w: World, n: number) => {
+  w.agents = Array.from({ length: n }, (_, i) => helper(i + 1))
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.10
+  await step($, w, 'm', 1_000, 0)
+  for (let i = 1; i <= n; i++) await start($, `h${i}`, `a${i}`)
+  await w.clock.advance(0)
+}
+const drawnHeight = async (mount: Promise<Ui>) => {
+  const ui: any = await mount
+  const h = height(await ui.drawn())
+  await ui.unmount()
+  return h
+}
+
+test('/radar opens the panel, closes it when it shows, and opens it again', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, '')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.closes).toEqual(['plugin'])
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('/radar open never closes; /radar close closes, and says when nothing is open', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  expect((await radarCmd($, 'open')).text).toMatch(/^Usage Radar opened/)
+  expect(w.closes).toEqual([])
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, 'close')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, 'close')).text).toBe("Usage Radar isn't open.")
+})
+
+test('every open asks for Esc to close the panel: /radar, a helper starting, a resize', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1)
+  await radarCmd($, 'budget 1')
+  await radarCmd($, 'open')
+  expect(w.openArgs.length).toBeGreaterThanOrEqual(3)
+  expect(w.openArgs.every(a => a.closeOnEscape === true)).toBe(true)
+})
+
+// (the test kit can't raise the person's own close, its mark or Esc: a bare /radar closes it here)
+test('closed with /radar: helpers starting leave it closed until /radar opens it again', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, '')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.closes).toEqual(['plugin'])
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2), helper(3)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  await start($, 'h3', 'a3')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 2)
+})
+
+test('after /radar close, the next helper does not open it again', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1)
+  await radarCmd($, 'close')
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+})
+
+test('a panel open but not drawn yet: /radar draws it, it does not close it', async ($, on) => {
+  const w = world(on)
+  w.placed = false
+  await withHelpers($, w, 1)
+  expect(w.panes.get(PANE_ID)).toEqual({ placed: false, shown: true })
+  w.placed = true
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.closes).toEqual([])
+  expect(w.panes.get(PANE_ID)).toEqual({ placed: true, shown: true })
+})
+
+test('a panel in a tab behind another: /radar brings it, and says how to show it', async ($, on) => {
+  const w = world(on)
+  w.shown = false
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  const text = (await radarCmd($, '')).text
+  expect(text).toMatch(/^Usage Radar opened/)
+  expect(text).toContain('ctrl+x tab')
+  expect(w.closes).toEqual([])
+})
+
+test('/radar says why the panel is not drawn, and a refused open gets a reply too', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  w.placed = false
+  expect((await radarCmd($, '')).text).toBe('Usage Radar is open but not drawn here yet: waits for 144 columns (100 now)')
+  w.panes.clear()
+  w.openDeny = true
+  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't open its panel here.")
+})
+
+test('a refused close: /radar says so, the panel stays open, and helpers still resize it', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1)
+  w.closeDeny = true
+  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't close its panel here. Try ctrl+x x.")
+  expect((await radarCmd($, 'close')).text).toBe("Usage Radar couldn't close its panel here. Try ctrl+x x.")
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  // not counted as closed by you: the next helper still opens (resizes) it
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 1)
+})
+
+test('/radar with anything else: a usage reply, nothing opens', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  const text = (await radarCmd($, 'foo')).text ?? ''
+  for (const word of ['/radar open', '/radar close', '/radar budget', '/radar private']) expect(text).toContain(word)
+  expect(w.openArgs.length).toBe(0)
+})
+
+test('on the main screen a helper does not open the panel; /radar still does', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(bandIn($, false), /Usage Radar/)
+  w.agents = [helper(1)]
+  await start($, 'h1', 'a1')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(0)
+  expect((await radarAt($, '', { isFullscreen: false, columns: 160 })).text).toMatch(/^Usage Radar opened above the prompt/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('in fullscreen a helper opens the panel', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(bandIn($, true), /Usage Radar/)
+  w.agents = [helper(1)]
+  await start($, 'h1', 'a1')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(1)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('/radar says the panel is above the prompt, unless fullscreen docks it', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  expect((await radarAt($, 'open', { isFullscreen: false, columns: 100 })).text).toContain('above the prompt')
+  expect((await radarAt($, 'open', { isFullscreen: true, columns: 100 })).text).toContain('above the prompt')
+  const docked = (await radarAt($, 'open', { isFullscreen: true, columns: 160 })).text
+  expect(docked).not.toContain('above the prompt')
+  expect(docked).toMatch(/^Usage Radar opened\. Close it with \/radar, \/radar close or Esc\.$/)
+})
+
+test('a short room above the prompt: one line per agent, no Limits, never taller than the room', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(30), seven(11)]
+  await withHelpers($, w, 3)
+  expect(await drawnHeight(inlinePane($, 8))).toBeLessThanOrEqual(8)
+  await shows(inlinePane($, 8), /^Main/, /Explore · Task 1/, /Explore · Task 2/, /Explore · Task 3/)
+  await hidden(inlinePane($, 8), /^Limits$/)
+  // plenty of room: the whole panel
+  await shows(inlinePane($, 200), /^Limits$/, /^5h limit/)
+})
+
+test('a short room with ten helpers: the first rows, then one +N more line', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 10)
+  expect(await drawnHeight(inlinePane($, 6))).toBeLessThanOrEqual(6)
+  await shows(inlinePane($, 6), /^\+\d+ more/)
+})
+
+// ── The spend check backing off ─────────────────────────────────────────
+const busyReply = (status: number, retryAfter?: string) =>
+  ({ status, ok: false, text: '', ...(retryAfter !== undefined && { headers: { 'retry-after': retryAfter } }) })
+// Advance in 10 s steps until the next request (at most `maxMs`); the gap since the one before
+const nextGap = async (w: World, maxMs: number): Promise<number> => {
+  const n = w.fetches.length
+  const from = w.clock.now()
+  while (w.fetches.length === n && w.clock.now() - from < maxMs) await w.clock.advance(10_000)
+  expect(w.fetches.length, `a request within ${maxMs} ms`).toBe(n + 1)
+  return (w.fetchedAt.at(-1) ?? 0) - (w.fetchedAt.at(-2) ?? 0)
+}
+// A reading of $12.40, then Anthropic answering `reply` from the next minute's check on
+const heldBack = async ($: Engine, w: World, reply: ReturnType<typeof busyReply>) => {
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$12\.40/)
+  w.reply = reply
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+}
+
+test('a 429 waits as Retry-After asks, keeps the reading, and never resizes the panel', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  const opened = w.opened.length
+  w.reply = busyReply(429, '300')
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(299_000)
+  expect(w.fetches.length).toBe(2)
+  for (let i = 0; i < 10; i++) {
+    const gap = await nextGap(w, 400_000)
+    expect(gap).toBeGreaterThanOrEqual(300_000)
+    expect(gap).toBeLessThanOrEqual(300_000 * 1.1 + 60_000)
+  }
+  await shows(pane($), /\$12\.40/)
+  expect(w.opened.length).toBe(opened)
+})
+
+test('a Retry-After date is waited for too', async ($, on) => {
+  const w = world(on)
+  // the 429 comes at the minute's check: wait until 3 minutes after it
+  await heldBack($, w, busyReply(429, new Date(60_000 + 180_000).toUTCString()))
+  const gap = await nextGap(w, 400_000)
+  expect(gap).toBeGreaterThanOrEqual(180_000)
+  expect(gap).toBeLessThanOrEqual(180_000 * 1.1 + 60_000)
+})
+
+for (const [label, retryAfter, least] of [['a second', '1', 60_000], ['a day', '86400', 15 * 60_000]] as const) {
+  test(`Retry-After of ${label} waits between a minute and 15 minutes`, { timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on)
+    await heldBack($, w, busyReply(429, retryAfter))
+    const gap = await nextGap(w, 20 * 60_000)
+    expect(gap).toBeGreaterThanOrEqual(least)
+    expect(gap).toBeLessThanOrEqual(least * 1.1 + 60_000)
+  })
+}
+
+test('without Retry-After each wait doubles to 15 minutes, and a good answer goes back to once a minute', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429))
+  for (const least of [120_000, 240_000, 480_000, 900_000]) {
+    const gap = await nextGap(w, 20 * 60_000)
+    expect(gap).toBeGreaterThanOrEqual(least)
+    expect(gap).toBeLessThanOrEqual(least * 1.1 + 60_000)
+  }
+  spendOn(w, SPEND(1300, 10000))
+  await nextGap(w, 20 * 60_000)
+  await shows(pane($), /\$13 of \$100 used/)
+  expect(await nextGap(w, 120_000)).toBe(60_000)
+})
+
+for (const status of [500, 503]) {
+  test(`a ${status} backs off like a 429 and keeps the reading`, { timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on)
+    await heldBack($, w, busyReply(status))
+    await w.clock.advance(60_000)
+    expect(w.fetches.length).toBe(2)
+    await w.clock.advance(15 * 60_000)
+    await shows(pane($), /\$12\.40/)
+  })
+}
+
+test('prompts and measures while held back make no request', async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '600'))
+  for (let t = 0; t < 5 * 60_000; t += 30_000) {
+    await w.clock.advance(30_000)
+    await measure($, [])
+    await prompt($, 'more')
+  }
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(2)
+})
+
+test('a reading over 10 minutes old says stale, in the band and the panel, until a good answer', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '300'))
+  await hidden(band($), /stale/)
+  await w.clock.advance(10 * 60_000)
+  await shows(band($), exactly(' · stale'))
+  await shows(pane($), /^\$12\.40 of \$100 used · last read over 10m ago$/)
+  // the meters still fit the band
+  const lines = await bandLines($, 100)
+  expect(columns(lines[2])).toBeLessThanOrEqual(96)
+  spendOn(w, SPEND(1240, 10000))
+  await nextGap(w, 400_000)
+  await hidden(band($), /stale/)
+  await hidden(pane($), /last read/)
+})
+
+test('another account while held back: the old dollars go at the next tick, the new account is read', async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
+  await heldBack($, w, busyReply(429, '900'))
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(5000, 10000))
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(3)
+  await hidden(pane($), /\$12\.40/)
+  await shows(pane($), /\$50 of \$100 used/)
+})
+
+test('backing off keeps nothing in the store: no dollars, no wait', async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '300'))
+  await w.clock.advance(10 * 60_000)
+  const all = JSON.stringify([...w.store.entries()])
+  expect(all).not.toContain('12.4')
+  expect(all).not.toContain('spend')
+  expect(all).not.toContain('hold')
+  expect(all).not.toContain('stale')
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private')).toBe(true)
+})
+
+// ── Helpers that end without a word, and readings that fail ─────────────
+test('a helper the list showed and then dropped has ended: the job ends after 30 s', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await start($, 'h1', 'a1')
+  await step($, w, 'h1', 2_000, 0, 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+  w.agents = []
+  await w.clock.advance(20_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await w.clock.advance(11_000)
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+  await hidden(band($), /Waiting for 1 helper/)
+  // the clock stands still
+  const time = async () => {
+    const ui = await pane($)
+    const t = (await ui.find({ type: 'Text', text: /^\d+:\d\d$/ }))?.text
+    await ui.unmount()
+    return t
+  }
+  const was = await time()
+  await w.clock.advance(30_000)
+  expect(await time()).toBe(was)
+  // the next prompt is a new job: its last request counts only its own tokens
+  await prompt($, 'next')
+  await start($, 'm2')
+  await step($, w, 'm2', 5_000, 0)
+  await shows(pane($), /^last request .* · 5k tokens · /)
+})
+
+test('a helper never listed (a workflow\'s) keeps running until its turn.complete', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await start($, 'h1', 'a1')
+  await complete($, 'm')
+  await w.clock.advance(120_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await shows(pane($), /1 running/)
+  await complete($, 'h1', 'a1')
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+})
+
+test('a helper missing from the list for 10 s, then listed again, still runs', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h1', 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+  w.agents = []
+  await w.clock.advance(10_000)
+  w.agents = [helper(1)]
+  await w.clock.advance(40_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await shows(pane($), /1 running/)
+})
+
+test('without a usage reading a job still starts, counts its tokens and ends', async ($, on) => {
+  const w = world(on)
+  w.usageBroken = true
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(pane($), exactly('Working'))
+  await step($, w, 'm', 5_000, 0)
+  await shows(pane($), exactly('5k'))
+  await tool($)
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+  await shows(pane($), exactly('Done'))
+})
+
+test('a refused /radar registration is tried again at the next prompt, with one spend timer', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  w.registerFails = 1
+  await begin($, w)
+  expect(w.registers).toBe(1)
+  expect(w.fetches.length).toBe(1)
+  await prompt($, 'go')
+  await w.clock.advance(0)
+  expect(w.registers).toBe(2)
+  await prompt($, 'more')
+  await w.clock.advance(0)
+  expect(w.registers).toBe(2)
+  const fetches = w.fetches.length
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(fetches + 1)
+})
+
+test('a session that ends while it starts starts no spend timer', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  w.onUsage = async () => { await $.session.end({ sessionId: 's1', reason: 'other' } as never) }
+  await begin($, w)
+  await w.clock.advance(300_000)
+  expect(w.fetches.length).toBe(0)
+})
+
+// ── Numbers ─────────────────────────────────────────────────────────────
+test('999,600 tokens read 1.0M, never 1000k', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01, 999_600)
+  await shows(band($), exactly('1.0M'))
+  await hidden(band($), /1000k/)
+})
+
+test('a reset under a minute away reads <1m', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(50, 20_000)]
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /resets in <1m/)
+  await hidden(pane($), /resets in 0m/)
+})
+
+test('a context percent that is not a number is left out', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  await $.session.measure({ context: { window: 200_000, percent: NaN }, rateLimits: [], changed: ['context'] } as never)
+  await hidden(band($), /NaN/)
+  await hidden(pane($), /NaN/)
+  await shows(pane($), /^Context/)
 })

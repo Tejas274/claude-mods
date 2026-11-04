@@ -30,6 +30,8 @@ export type Agent = {
   pausedMs: number
   /** it worked in this job (the job's toast and the band count these) */
   thisJob: boolean
+  /** when $.agent.list() last listed it while running (null: not since it started); not saved */
+  seenAt: number | null
 }
 
 /** A finished helper as kept in the session record */
@@ -143,6 +145,8 @@ export type Live = {
   account: Account | null
   /** the account's spend limit in dollars, read from Anthropic once a minute (null: none; not saved) */
   spend: Spend | null
+  /** the spend reading is over 10 minutes old (checks failing or held back); not saved */
+  spendStale: boolean
   /** /radar private: email and session name hidden (global, stored as one boolean, not per session) */
   private: boolean
 }

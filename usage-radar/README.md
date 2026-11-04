@@ -35,7 +35,7 @@ the session name (on by default; `showName: false` turns it off, `/radar private
 
 `/radar` opens a panel: cost / tokens / time for the session (plus a `Left` tile with what's left of your spend limit, if you have one) and the "last request" line, the limits with when they reset (the spend limit also in dollars, like `$87.60 left` and `$12.40 of $100 used`), and one row per agent with its own cost, tokens and time. helper rows read `type · description` (like `Explore · Find the config`), teammates show their name. an idle teammate shows `idle` and its clock pauses.
 
-it also opens on its own when claude starts helper agents. on a wide terminal it docks on the right.
+it also opens on its own when claude starts helper agents in fullscreen on a wide terminal (144 columns, or 110 once you've opened it with `/radar`), unless you closed it (then it stays closed until you run `/radar` again). in fullscreen from 110 columns it docks on the right; otherwise it sits above the prompt, and when there isn't much room there it switches to a compact view with one line per agent. on the main screen (`CLAUDE_CODE_NO_FLICKER=0`, tmux) it only opens when you ask, since there it would push your prompt around. close it with `/radar` again, `/radar close`, Esc at an empty prompt while claude is idle, ctrl+x x, or its close mark in fullscreen.
 
 while a helper runs, its row is bold with a spinner and the finished ones are dimmed:
 
@@ -45,7 +45,7 @@ while a helper runs, its row is bold with a spinner and the finished ones are di
 
 ![the spend limit in the /radar panel](docs/images/panel-spend.png)
 
-if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$87.60 left  12%`, with `$12.40 of $100 used` under it. over the limit it reads `$3.50 over  ⛔ 103%`. the band keeps it short: `Spend $87.60 left 12%`, never what you've used. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if a check fails it keeps the last reading for up to 3 minutes, then drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
+if your account has a monthly spend limit (like on a team or enterprise plan), the limits start with a `Spend` row: `$87.60 left  12%`, with `$12.40 of $100 used` under it. over the limit it reads `$3.50 over  ⛔ 103%`. the band keeps it short: `Spend $87.60 left 12%`, never what you've used. it's read from anthropic with claude code's own login, once a minute, also while you're idle. a reset time only shows if claude code itself reports one. no claude login (an API key, bedrock, vertex, a gateway)? then there's no dollar row, just claude code's own percent if it gives one. if anthropic is busy (it answers 429 or a server error) the last reading stays and the next check waits as long as anthropic asks, else 2, 4, 8 then 15 minutes, so between about 1 and 16 minutes. once the reading is over 10 minutes old it says `stale` in the band (and `last read over 10m ago` in the panel), until a check gets through. any other failed check keeps the last reading too, but the third in a row drops it. switching login (another account, an API key, another provider) drops it at the next check, within a minute. `showSpend` turns it off.
 
 #### session budget
 
@@ -110,7 +110,9 @@ for example, labels for a work and a personal account:
 
 | command | what it does |
 | --- | --- |
-| `/radar` | open the panel |
+| `/radar` | open the panel, or close it if it's showing |
+| `/radar open` | open the panel (never closes it) |
+| `/radar close` | close the panel; it stays closed until you open it again |
 | `/radar budget <n>` | set a budget for this session, e.g. `5` or `$2.50` |
 | `/radar budget` | show where you are |
 | `/radar budget off` | turn it off |
@@ -134,12 +136,13 @@ time is working time: from your prompt until every agent is done. idle gaps betw
 
 totals are saved per session in the mod's own local store, so `claude --resume` (even days later) carries on from where you left off. `/clear` starts fresh. sessions you haven't used for 90 days are pruned. the store also holds the session name, which can be the first 5 words of your first prompt.
 
-it reads your usage from anthropic using claude code's own login, once a minute, and nothing goes anywhere else. the dollar amounts stay in memory, they're never saved. don't want that request? set `showSpend` to `false`. the account's email and organization are read only to draw the badge: they're never stored or sent. for private mode the store only remembers whether it's on (true or false).
+it reads your usage from anthropic using claude code's own login, about once a minute (less while anthropic asks to slow down), and nothing goes anywhere else. the dollar amounts stay in memory, they're never saved. don't want that request? set `showSpend` to `false`. the account's email and organization are read only to draw the badge: they're never stored or sent. for private mode the store only remembers whether it's on (true or false).
 
 </details>
 
 ### changelog
 
+- 2.4.2 the panel works on every terminal: `/radar` now opens and closes it (plus `/radar open` and `/radar close`), Esc closes it, it no longer pops up on its own on the main screen or after you closed it, it says why when it can't be drawn yet, and above a short prompt it shows one line per agent. the spend check backs off when anthropic is busy (429 or a server error) instead of dropping your reading, waiting as anthropic asks (1 to 15 minutes), and marks an old reading `stale`. a helper that ends without saying so no longer keeps the job running, a failed usage reading no longer stops a job from starting or ending, `/radar` is registered again if it was refused, and no more `1000k`, `0m` or `NaN`
 - 2.4.1 the account, the spend limit, private mode and /radar start on the first prompt or turn when another plugin skips the session start, so the Spend row still shows (and a private email stays hidden)
 - 2.4.0 a tidier three-line band (no separate context bar line, meters that never wrap, a header that fits 60 columns by dropping the word `tokens`, then the time, then the model, never the cost), `last request` instead of `this request`, shown once there's a first request, what's left of the spend limit up front (`$87.60 left`, a `Left` tile in the panel), the email and the session name shown by default (`hideEmail` is replaced by `showEmail`, plus `showName`) with a dim `(/radar private to hide)` hint, `/radar private` to hide both in one step (`/radar private off` shows them again), no badge for an unlabelled account without an email (never the organization or config folder), and the open panel resizes when the session name or the meters arrive
 - 2.3.0 your real spend limit in dollars (used, left, cap) first in the limits, read from anthropic with claude code's login once a minute; `showSpend` turns it off

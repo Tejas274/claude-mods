@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, PromptSubmitInput, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, PromptSubmitInput, Register, Timer, UiOpenResult, UiPane } from 'claude-code'
 
 import type { Account, Agent, Earlier, Limit, Live, NameKind, Pace, Saved, SavedAgent, Spend, Todo, Track } from '../types'
 
@@ -37,9 +37,10 @@ const EMPTY: Live = {
   pace: { wall: null, active: 0, kinds: {} },
   account: null,
   spend: null,
+  spendStale: false,
   private: false,
 }
-const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v6' })
+const live = atom({ plugin: 'usage-radar', key: 'radar' } as const, EMPTY, { shape: 'v7' })
 
 const PANE = 'radar-agents'
 // tiles (4) + summary (2) + the limits block (2 + 2 per meter, when shown) + 3 rows per
@@ -59,6 +60,11 @@ const SPEND_SLACK_MS = 5_000 // checks are at least SPEND_MS minus this apart, s
 const SPEND_URL = 'https://api.anthropic.com/api/oauth/usage'
 const SPEND_STUCK_MS = 5 * 60_000 // a reading that never answers stops blocking the next one after this
 const SPEND_MISSES = 3 // after this many failed checks in a row, the last reading is dropped
+const SPEND_HOLD_MAX_MS = 15 * 60_000 // while Anthropic asks us to slow down (429, 5xx), at most this long between checks
+const SPEND_STALE_MS = 10 * 60_000 // a reading older than this is marked stale
+const SPEND_JITTER = 0.1 // a wait is up to 10% longer, so many sessions don't all ask at once
+const GONE_MS = 30_000 // a helper listed before and missing this long has ended
+const DOCK_COLUMNS = 110 // the fullscreen layout docks the panel on the right from this width
 
 // The limit forecast: how fast each limit fills while working, over the last 10 minutes of work
 const WINDOW_MS = 600_000 // pace is measured over this much working time
@@ -97,7 +103,7 @@ const prettyModel = (id: string): string => {
 
 // 79_400 → "79k"
 const k = (n: number): string =>
-  n >= 1_000_000 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
+  n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
 
 const money = (usd: number | null): string => (usd === null ? '—' : `≈$${usd.toFixed(2)}`)
 
@@ -420,6 +426,7 @@ const freshSession = (p: Live, id: string, saved: Saved | null, ledger: number |
     pace: p.pace,
     account: p.account,
     spend: p.spend,
+    spendStale: p.spendStale,
     private: p.private,
     lastLedger: ledger,
     ...(saved && {
@@ -456,6 +463,7 @@ const restored = (a: SavedAgent): Agent => ({
   pausedAt: null,
   pausedMs: 0,
   thisJob: false,
+  seenAt: null,
 })
 
 // Put one agent's change into the list (adds it if new)
@@ -477,6 +485,7 @@ const withAgent = (p: Live, id: string, change: (a: Agent) => Agent): Live => {
     pausedAt: null,
     pausedMs: 0,
     thisJob: true,
+    seenAt: null,
   }
   const next = change(base)
   const agents = known ? p.agents.map(a => (a.id === id ? next : a)) : [...p.agents, next]
@@ -555,6 +564,8 @@ const newJob = (p: Live, now: number, cost: number | null, window: number): Live
 // The engine's list of agents (read while working): names for helpers we couldn't name,
 // helpers that ended without a turn.complete, and helpers that went idle or work again.
 // A helper that (re)started after the list was read (`readAt`) waits for the next reading.
+// A running helper the list showed before and has left out for GONE_MS has ended too (the
+// engine drops a finished one's entry). One never listed (a workflow's) waits for its turn.complete.
 const DONE = ['completed', 'failed', 'killed']
 const IDLE = ['idle', 'waiting']
 const withList = (
@@ -564,9 +575,14 @@ const withList = (
   readAt: number = now,
 ): Live =>
   helpers(p).reduce((q, a) => {
+    if (a.isRunning && a.startedAt > readAt) return q
     const info = list.find(x => x.id === a.id)
-    if (!info || (a.isRunning && a.startedAt > readAt)) return q
-    const named = a.name === 'Helper' ? withAgent(q, a.id, x => ({ ...x, name: agentLabel(info) })) : q
+    if (!info) {
+      const gone = a.isRunning && a.seenAt !== null && readAt - a.seenAt >= GONE_MS
+      return gone ? withAgent(q, a.id, x => finished(q, x)) : q
+    }
+    const seen = a.isRunning ? withAgent(q, a.id, x => ({ ...x, seenAt: readAt })) : q
+    const named = a.name === 'Helper' ? withAgent(seen, a.id, x => ({ ...x, name: agentLabel(info) })) : seen
     if (!a.isRunning) return named
     if (DONE.includes(info.status)) return withAgent(named, a.id, x => finished(named, x))
     if (IDLE.includes(info.status)) return withAgent(named, a.id, x => ({ ...x, pausedAt: x.pausedAt ?? now }))
@@ -585,6 +601,7 @@ const levelColor = (pctUsed: number): string => (pctUsed >= DANGER ? RED : pctUs
 // 7_800_000 → "2h 10m"; also "3d 4h", "12m"
 const duration = (ms: number): string => {
   const m = Math.round(ms / 60_000)
+  if (m < 1) return '<1m'
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
   if (h < 48) return `${h}h ${m % 60}m`
@@ -666,6 +683,22 @@ const spendLeft = (s: Spend): { title: string; text: string } =>
 // "$12.40 of $100 used"
 const spendUsed = (s: Spend): string => `${cash(s.used, s.currency)} of ${cash(s.cap, s.currency)} used`
 
+// A Retry-After header in ms from now: seconds ("120") or an HTTP date; null when it's neither
+const retryAfterMs = (value: string | undefined, now: number): number | null => {
+  const v = value?.trim() ?? ''
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  const at = v ? Date.parse(v) : NaN
+  return Number.isFinite(at) ? at - now : null
+}
+
+// How long to wait after a busy answer (429, 5xx): what Anthropic asks, else 2, 4, 8, then 15
+// minutes; never under a minute or over 15, then up to 10% longer (`jitter` 0 to 1)
+const holdMs = (retryAfter: string | undefined, now: number, backoffs: number, jitter: number): number => {
+  const base = retryAfterMs(retryAfter, now) ?? SPEND_MS * 2 ** Math.min(backoffs, 4)
+  const clamped = Math.min(SPEND_HOLD_MAX_MS, Math.max(SPEND_MS, base))
+  return Math.round(clamped * (1 + SPEND_JITTER * Math.min(1, Math.max(0, jitter))))
+}
+
 // ── The forecast: when a limit runs out at the pace it fills while working ──
 // The clock here is working time: a gap of over a minute between two readings, time while
 // the job stands idle, or the gap before a job (wall null), adds nothing, and what a limit
@@ -716,8 +749,9 @@ const forecastMs = (p: Live, l: Limit): number | null => {
 const leftText = (ms: number): string => `~${duration(Math.max(60_000, ms))} left`
 
 // Every meter we watch: the spend limit first, then the plan limits, then context.
-// `left`: the forecast, for limits; `spend`: the dollars, when Anthropic told us them
-type Meter = { key: string; label: string; pct: number; resetsAt?: string; left: number | null; spend?: Spend }
+// `left`: the forecast, for limits; `spend`: the dollars, when Anthropic told us them, and
+// `stale`: that reading is over 10 minutes old
+type Meter = { key: string; label: string; pct: number; resetsAt?: string; left: number | null; spend?: Spend; stale?: boolean }
 const limitMeter = (p: Live, l: Limit): Meter => ({
   key: l.kind,
   label: limitLabel(l.kind),
@@ -730,7 +764,15 @@ const limitMeter = (p: Live, l: Limit): Meter => ({
 const meters = (p: Live): Meter[] => {
   const engine = p.limits.find(l => l.kind === 'spend_limit')
   const spend: Meter[] = p.spend
-    ? [{ key: 'spend_limit', label: 'Spend', pct: p.spend.pct, resetsAt: engine?.resetsAt, left: engine ? forecastMs(p, engine) : null, spend: p.spend }]
+    ? [{
+        key: 'spend_limit',
+        label: 'Spend',
+        pct: p.spend.pct,
+        resetsAt: engine?.resetsAt,
+        left: engine ? forecastMs(p, engine) : null,
+        spend: p.spend,
+        stale: p.spendStale,
+      }]
     : engine
       ? [limitMeter(p, engine)]
       : []
@@ -747,13 +789,14 @@ const levelText = (pctUsed: number): string => `${glyph(pctUsed) ? `${glyph(pctU
 // a forecast after a meter: " · ~25m left"
 const paceText = (m: Meter): string => (m.left !== null ? ` · ${leftText(m.left)}` : '')
 
-// How wide one meter is on the band: "Spend $87.60 left ⚠ 84%" (the dollars, no bar), else
-// "5h limit ━━━━━━━━━━ 84% ⚠"; then its forecast
+// How wide one meter is on the band: "Spend $87.60 left ⚠ 84%" (the dollars, no bar; " · stale"
+// after an old reading), else "5h limit ━━━━━━━━━━ 84% ⚠"; then its forecast
 const BAND_BAR = 10
+const STALE = ' · stale'
 const bandWidth = (m: Meter): number => {
   const l = m.spend ? spendLeft(m.spend) : null
   const body = l
-    ? `${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}`.length
+    ? `${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}${m.stale ? STALE : ''}`.length
     : `${m.label} `.length + BAND_BAR + ` ${Math.round(m.pct)}%`.length + (m.pct >= WARN ? 2 : 0)
   return body + paceText(m).length
 }
@@ -805,10 +848,10 @@ const withUsage = (
   const next: Live = {
     ...(at > p.now ? withNow(p, at) : p),
     limits: fresh,
-    contextPct: contextPct ?? p.contextPct,
+    contextPct: typeof contextPct === 'number' && Number.isFinite(contextPct) ? contextPct : p.contextPct,
     pace: withPace(p, fresh, now),
   }
-  const { alerted, alerts } = meterAlerts(next, p.alerted, p.now)
+  const { alerted, alerts } = meterAlerts(next, p.alerted, next.now)
   // the forecast: ⚠ under 30 minutes, ⛔ under 10, each once; again after a reset, or once it's
   // gone or an hour away while working (an idle job keeps what was shown)
   for (const l of isIdle(next) ? [] : next.limits) {
@@ -1090,16 +1133,46 @@ const detectAccount = async ($: EngineInterface): Promise<Account> => {
   return { ...found, configDir: dir ? shortDir(dir, home) : '~/.claude' }
 }
 
+// ── The panel: every open goes through here ─────────────────────────────
+let paneDismissed = false // closed by hand (or /radar close): no unasked opens until /radar
+let fullscreen: boolean | undefined // the layout, from the band's viewport or a command's presentation; undefined: unknown
+
+// Open (or resize) the panel, as tall as it draws. Every open asks for Esc to close it: each
+// open sets that anew. Never throws: null when the open was refused
+const openPane = async ($: EngineInterface, p: Live, cfg: Config): Promise<UiOpenResult | null> => {
+  try {
+    return await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, cfg), columns: PANE_COLUMNS, closeOnEscape: true })
+  } catch {
+    return null
+  }
+}
+
+// The panel as the engine lists it (undefined: not open, or the list failed)
+const paneOf = async ($: EngineInterface): Promise<UiPane | undefined> => {
+  try {
+    return (await $.ui.panes()).find(pane => pane.id === PANE)
+  } catch {
+    return undefined
+  }
+}
+
+// Close the panel, as you asked: no unasked opens after this until /radar. 'refused' when the
+// close was refused and the panel is still open (then nothing changes)
+const closePane = async ($: EngineInterface): Promise<'closed' | 'not-open' | 'refused'> => {
+  const was = await paneOf($)
+  try {
+    await $.ui.close({ id: PANE })
+  } catch {
+    if (was) return 'refused'
+  }
+  paneDismissed = true
+  return was ? 'closed' : 'not-open'
+}
+
 // An open panel takes its new height (a meter or the budget bar came or went); a closed one is
 // sized when it opens
 const resizeIfOpen = async ($: EngineInterface, p: Live, cfg: Config): Promise<void> => {
-  try {
-    if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
-      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, cfg), columns: PANE_COLUMNS })
-    }
-  } catch {
-    // ignore: the next open sizes it
-  }
+  if (await paneOf($)) await openPane($, p, cfg) // ignore a failure: the next open sizes it
 }
 
 // An open panel takes its new height only when it changed
@@ -1122,6 +1195,9 @@ let spendAt: number | null = null // when the last check started, so checks stay
 let spendBusyAt: number | null = null // a check on its way since then (null: none)
 let spendCheck = 0 // which check is the latest, so a late answer of an older one is dropped
 let spendMisses = 0 // failed checks in a row; the last reading is kept until SPEND_MISSES
+let spendHoldUntil: number | null = null // Anthropic asked us to slow down: no request before this
+let spendBackoffs = 0 // busy answers (429, 5xx) in a row, so each wait is longer
+let spendOkAt: number | null = null // when the reading on screen was read (null: none)
 
 // The session's login: a claude login's handle, 'none' (an API key, Bedrock, Vertex, a gateway,
 // no login: there's no spend limit to read) or 'fail' (asking failed: try again later). Never throws.
@@ -1134,17 +1210,19 @@ const loginOf = async ($: EngineInterface): Promise<{ handle: string } | 'none' 
   }
 }
 
-// One request with that login. `ok: false` when it failed (refused, an error, an odd answer);
+// One request with that login. `ok: false` when it failed (refused, an error, an odd answer),
+// with `busy` when Anthropic asked us to slow down (429, or a 5xx) and its Retry-After;
 // `ok: true` when Anthropic answered, with spend null when the account has no spend limit.
 // Only the numbers are kept, nothing is logged. Never throws.
-const fetchSpend = async ($: EngineInterface, handle: string): Promise<{ ok: true; spend: Spend | null } | { ok: false }> => {
+type SpendAnswer = { ok: true; spend: Spend | null } | { ok: false; busy: boolean; retryAfter?: string }
+const fetchSpend = async ($: EngineInterface, handle: string): Promise<SpendAnswer> => {
   try {
     const r = await $.http.fetch(SPEND_URL, { auth: handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
-    if (!r.ok) return { ok: false }
+    if (!r.ok) return { ok: false, busy: r.status === 429 || r.status >= 500, retryAfter: r.headers?.['retry-after'] }
     const o = jsonObject(r.text)
-    return o ? { ok: true, spend: spendOf(o) } : { ok: false }
+    return o ? { ok: true, spend: spendOf(o) } : { ok: false, busy: false }
   } catch {
-    return { ok: false }
+    return { ok: false, busy: false }
   }
 }
 
@@ -1164,7 +1242,9 @@ const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, ac
   const after = await update($, live, p => {
     // update may run this more than once: only the last run's outcome counts
     alerts = []
-    const base = account ? { ...p, account } : p
+    // a reading (or none) is never stale
+    const withAccount = account ? { ...p, account } : p
+    const base = withAccount.spendStale ? { ...withAccount, spendStale: false } : withAccount
     if (sameSpend(p.spend, spend)) return base
     const q: Live = { ...base, spend }
     const r = meterAlerts(q, p.alerted, p.now)
@@ -1179,14 +1259,20 @@ const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, ac
 
 // Read the spend limit, at most once a minute (from the minute timer, or an event: start, a prompt,
 // a measure) and one check at a time. Nothing drawn (a -p run, an SDK session no client attached
-// to yet): no request. A failed check keeps the last reading; the third in a row drops it. An
-// answer without a spend limit, or another login (no claude login, another account), drops it at once.
+// to yet): no request. A busy answer (429, 5xx) keeps the last reading and holds the next request
+// back as Anthropic asks (else 2, 4, 8, then 15 minutes); a reading over 10 minutes old is marked
+// stale. Another failed check keeps the last reading; the third in a row drops it. An answer
+// without a spend limit, or another login (no claude login, another account), drops it at once.
 const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
   if (!cfg.showSpend) return
   let now: number | null = null
   try {
     if ((await $.session.surfaces()).length === 0) return
     now = await $.clock.now()
+    // the reading on screen is getting old (checks failing or held back): say so
+    if (spendOkAt !== null && now - spendOkAt >= SPEND_STALE_MS) {
+      await update($, live, p => (p.spend && !p.spendStale ? { ...p, spendStale: true } : p))
+    }
     if (spendBusyAt !== null && now - spendBusyAt < SPEND_STUCK_MS) return
     if (spendAt !== null && now >= spendAt && now - spendAt < SPEND_MS - SPEND_SLACK_MS) return
     spendAt = spendBusyAt = now
@@ -1194,31 +1280,48 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
     const login = await loginOf($)
     if (check !== spendCheck) return
     if (login === 'none') {
-      spendMisses = 0
+      spendMisses = spendBackoffs = 0
+      spendHoldUntil = null
       return await putSpend($, cfg, null)
     }
-    let got: { ok: true; spend: Spend | null } | { ok: false } = { ok: false }
+    let got: SpendAnswer = { ok: false, busy: false }
     if (login !== 'fail') {
       // another account than the one on screen: its reading goes now, before the new one comes
       const who = await detectAccount($)
       if (switched((await read($, live)).account, who)) {
-        spendMisses = 0
+        spendMisses = spendBackoffs = 0
+        spendHoldUntil = null // the hold was the old account's
         await putSpend($, cfg, null, who)
       }
+      // Anthropic asked us to wait: no request until then (the reading stays)
+      if (spendHoldUntil !== null && now < spendHoldUntil) return
       got = await fetchSpend($, login.handle)
       // a newer check started meanwhile (this one was stuck): its answer counts, not this one
       if (check !== spendCheck) return
       // the account changed while this one was on its way: its answer is the old account's
       const after = await detectAccount($)
       if (switched(who, after)) {
-        spendMisses = 0
+        spendMisses = spendBackoffs = 0
+        spendHoldUntil = null
         spendAt = null // the next tick or event checks the new account right away
         return await putSpend($, cfg, null, after)
       }
     }
-    spendMisses = got.ok ? 0 : spendMisses + 1
-    if (!got.ok && spendMisses < SPEND_MISSES) return
-    await putSpend($, cfg, got.ok ? got.spend : null)
+    if (got.ok) {
+      spendMisses = spendBackoffs = 0
+      spendHoldUntil = null
+      spendOkAt = got.spend ? now : null
+      return await putSpend($, cfg, got.spend)
+    }
+    // busy: wait longer each time, keep the reading (not a miss)
+    if (got.busy) {
+      spendBackoffs++
+      spendHoldUntil = now + holdMs(got.retryAfter, now, spendBackoffs, Math.random())
+      return
+    }
+    spendMisses++
+    if (spendMisses < SPEND_MISSES) return
+    await putSpend($, cfg, null)
   } catch {
     // ignore: the next check tries again
   } finally {
@@ -1271,19 +1374,24 @@ const syncSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
 // from whichever comes first: session.start, a prompt, or the main agent's turn (a plugin
 // above may swallow session.start). session.end lets the next session start them again
 let starting: Promise<void> | null = null
+let sessionGen = 0 // which session this is: session.end moves it on, so a start still on its way stops
 
 const startSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
+  const gen = sessionGen
+  await loadPrivate($) // first: a private email is never drawn
+  await syncSession($, cfg)
+  // the session ended meanwhile: start no timer (the next session starts its own)
+  if (gen !== sessionGen) return
   try {
-    await loadPrivate($) // first: a private email is never drawn
-    await syncSession($, cfg)
     startSpend($, cfg)
     await $.command.register({
       name: 'radar',
       description:
-        'Open Usage Radar; /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
+        'Open or close Usage Radar (/radar close closes it); /radar budget <amount|off> sets a cost budget for this session; /radar private hides your email and session name (/radar private off shows them)',
     })
   } catch {
-    // ignore: a refused command leaves the rest running, a prompt re-reads the session
+    // a refused command: the next prompt or turn starts again (startSpend keeps one timer)
+    if (gen === sessionGen) starting = null
   }
 }
 
@@ -1425,6 +1533,7 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     stopTicker()
     stopSpend()
+    sessionGen++ // a start still on its way stops
     starting = null // the next session (after /clear) starts again
     await save($)
     return next(e)
@@ -1458,52 +1567,91 @@ export const register: Register = (on, options) => {
     return r
   }).catch(($, e, next) => next(e))
 
-  // ── /radar opens the panel; /radar budget <amount|off> sets this session's budget;
-  //    /radar private [on|off] hides (or shows again) the email and the session name, every session ─
+  // ── /radar opens the panel, or closes it when it shows; /radar open and /radar close do just
+  //    that; /radar budget <amount|off> sets this session's budget; /radar private [on|off] hides
+  //    (or shows again) the email and the session name, every session ─
   on('command.run', { command: 'radar' }, async ($, e) => {
-    const pm = /^private\b\s*(.*)$/i.exec(e.args.trim())
-    if (pm) {
-      const a = (pm[1] ?? '').trim().toLowerCase()
-      if (a !== '' && a !== 'on' && a !== 'off') return { text: 'Usage Radar: use /radar private or /radar private off' }
-      const hide = a !== 'off'
-      const before = await read($, live)
-      const after = await update($, live, p => (p.private === hide ? p : { ...p, private: hide }))
-      try {
-        await $.store.set(PRIVATE_KEY, hide)
-      } catch {
-        // not kept for the next session; this one still changes
+    const pres = e.presentation ?? { isFullscreen: false, columns: 80 }
+    if (e.presentation) fullscreen = e.presentation.isFullscreen
+    try {
+      const pm = /^private\b\s*(.*)$/i.exec(e.args.trim())
+      if (pm) {
+        const a = (pm[1] ?? '').trim().toLowerCase()
+        if (a !== '' && a !== 'on' && a !== 'off') return { text: 'Usage Radar: use /radar private or /radar private off' }
+        const hide = a !== 'off'
+        const before = await read($, live)
+        const after = await update($, live, p => (p.private === hide ? p : { ...p, private: hide }))
+        try {
+          await $.store.set(PRIVATE_KEY, hide)
+        } catch {
+          // not kept for the next session; this one still changes
+        }
+        // the name row (and an unlabelled badge) came or went: an open panel takes its new height
+        await resizeIfChanged($, before, after, cfg)
+        return { text: hide ? 'Private mode on: email and session name hidden.' : 'Private mode off: email and session name shown.' }
       }
-      // the name row (and an unlabelled badge) came or went: an open panel takes its new height
-      await resizeIfChanged($, before, after, cfg)
-      return { text: hide ? 'Private mode on: email and session name hidden.' : 'Private mode off: email and session name shown.' }
-    }
-    const m = /^budget\b\s*(.*)$/i.exec(e.args.trim())
-    if (!m) {
-      const p = await read($, live)
-      await $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(p, cfg), columns: PANE_COLUMNS })
-      return { text: 'Usage Radar opened.' }
-    }
-    await syncSession($, cfg)
-    const arg = parseBudgetArg(m[1] ?? '')
-    if (arg === null) return { text: 'Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50), or off.' }
-    if (arg === 'show') {
-      const p = await read($, live)
-      return {
-        text: p.budget === null
-          ? 'No budget for this session. Set one with /radar budget 5'
-          : `Budget: ${budgetText(p)} (${Math.round((p.sessionCost / p.budget) * 100)}%)`,
+      const m = /^budget\b\s*(.*)$/i.exec(e.args.trim())
+      if (!m) {
+        const word = e.args.trim().toLowerCase()
+        const replies = {
+          closed: 'Usage Radar closed. /radar opens it again.',
+          'not-open': "Usage Radar isn't open.",
+          refused: "Usage Radar couldn't close its panel here. Try ctrl+x x.",
+        }
+        if (word === 'close') return { text: replies[await closePane($)] }
+        if (word !== '' && word !== 'open') {
+          return {
+            text: 'Usage Radar: /radar opens or closes the panel; also /radar open, /radar close, /radar budget <amount|off>, /radar private [off]',
+          }
+        }
+        // bare /radar closes the panel when you can see it; anything else (closed, waiting undrawn,
+        // in a tab behind another pane) opens it
+        const pane = word === '' ? await paneOf($) : undefined
+        if (pane?.isPlaced && pane.isShown) {
+          const how = await closePane($)
+          return { text: how === 'refused' ? replies.refused : replies.closed }
+        }
+        paneDismissed = false
+        const r = await openPane($, await read($, live), cfg)
+        if (r === null) return { text: "Usage Radar couldn't open its panel here." }
+        if (!r.isPlaced) return { text: `Usage Radar is open but not drawn here yet: ${r.reason}` }
+        const where =
+          !pres.isFullscreen || pres.columns < DOCK_COLUMNS
+            ? ` above the prompt (it docks on the right in fullscreen from ${DOCK_COLUMNS} columns)`
+            : ''
+        const tab = (await paneOf($))?.isShown === false ? " It's in a tab behind another pane: ctrl+x tab shows it." : ''
+        return { text: `Usage Radar opened${where}.${tab} Close it with /radar, /radar close or Esc.` }
       }
+      await syncSession($, cfg)
+      const arg = parseBudgetArg(m[1] ?? '')
+      if (arg === null) return { text: 'Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50), or off.' }
+      if (arg === 'show') {
+        const p = await read($, live)
+        return {
+          text: p.budget === null
+            ? 'No budget for this session. Set one with /radar budget 5'
+            : `Budget: ${budgetText(p)} (${Math.round((p.sessionCost / p.budget) * 100)}%)`,
+        }
+      }
+      // levels already crossed count as warned: no toast for them now, the reply says so
+      const before = (await read($, live)).budget
+      const p = await update($, live, q => withBudgetSet(q, arg === 'off' ? null : arg))
+      await save($)
+      // the budget bar came or went under the cost tile: an open panel takes its new height
+      if ((before === null) !== (p.budget === null)) await resizeIfOpen($, p, cfg)
+      if (arg === 'off') return { text: 'Budget off for this session.' }
+      const past = p.budgetFired > 0 ? ` · already past ${p.budgetFired}%` : ''
+      return { text: `Budget set: ${dollars(arg)} for this session · ${money(totalCost(p))} spent so far${past}` }
+    } catch {
+      return { text: "Usage Radar couldn't do that just now. Try again in a moment." }
     }
-    // levels already crossed count as warned: no toast for them now, the reply says so
-    const before = (await read($, live)).budget
-    const p = await update($, live, q => withBudgetSet(q, arg === 'off' ? null : arg))
-    await save($)
-    // the budget bar came or went under the cost tile: an open panel takes its new height
-    if ((before === null) !== (p.budget === null)) await resizeIfOpen($, p, cfg)
-    if (arg === 'off') return { text: 'Budget off for this session.' }
-    const past = p.budgetFired > 0 ? ` · already past ${p.budgetFired}%` : ''
-    return { text: `Budget set: ${dollars(arg)} for this session · ${money(totalCost(p))} spent so far${past}` }
   })
+
+  // ── You close the panel (its mark, ctrl+x x, Esc): it stays closed until /radar ─
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person') paneDismissed = true
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // ── You press Enter: start a new job (unless helpers are still working) ─
   on('prompt.submit', async ($, e, next) => {
@@ -1528,9 +1676,15 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const now = await $.clock.now()
-    const usage = await $.session.usage()
-    const cost = usage.cost?.usd ?? null
-    const window = usage.context.window || 200_000
+    // no reading (the engine refused): the job still starts, the next reading catches up
+    let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
+    try {
+      usage = await $.session.usage()
+    } catch {
+      // ignore
+    }
+    const cost = usage?.cost?.usd ?? null
+    const window = usage?.context.window || 200_000
 
     let alerts: string[] = []
     const p = await update($, live, p => {
@@ -1541,6 +1695,7 @@ export const register: Register = (on, options) => {
       // from idle: the time since the last reading (you thinking, typing) isn't working time,
       // nor what a limit rose meanwhile; the forecast's clock picks up from here
       const base = isIdle(q) ? { ...job, pace: { ...job.pace, wall: null } } : job
+      if (!usage) return base
       const r = withUsage(base, usage.rateLimits, usage.context.percent, now)
       alerts = r.alerts
       return r.next
@@ -1574,16 +1729,17 @@ export const register: Register = (on, options) => {
           pausedAt: null,
           pausedMs: goingOn ? a.pausedMs : 0,
           thisJob: true,
+          seenAt: null,
         }
       }),
     )
     // the clock ticks again, even if the job had ended
     startTicker($)
 
-    // a helper appeared → show the panel, tall enough for every agent
-    if (e.agentId) {
-      void $.ui.open({ id: PANE, title: 'Usage Radar', rows: panelRows(after, cfg), columns: PANE_COLUMNS })
-    }
+    // a helper appeared → show the panel, tall enough for every agent. Not after you closed it
+    // (until /radar), nor on the main screen, where an unasked panel takes over above the prompt:
+    // there an open one only takes its new height
+    if (e.agentId) void (!paneDismissed && fullscreen !== false ? openPane($, after, cfg) : resizeIfOpen($, after, cfg))
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -1597,14 +1753,20 @@ export const register: Register = (on, options) => {
       // a helper we couldn't name at its start: ask again (it may be listed by now)
       const known = (await read($, live)).agents.find(a => a.id === id)
       const name = e.agentId && (!known || known.name === 'Helper') ? await agentName($, e.agentId) : undefined
-      const usage = await $.session.usage()
+      // no reading (the engine refused): the step's tokens, model and context still count
+      let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
+      try {
+        usage = await $.session.usage()
+      } catch {
+        // ignore
+      }
       const now = await $.clock.now()
       const fresh = freshTokens(u)
       let alerts: string[] = []
       // the first request brings the last request row (and a reading may bring meters): an open panel takes them
       const before = await read($, live)
       const p = await update($, live, p => {
-        const counted = withWorking(withLedger({ ...p, window: usage.context.window || p.window }, usage.cost?.usd ?? null), id, now)
+        const counted = withWorking(withLedger({ ...p, window: usage?.context.window || p.window }, usage?.cost?.usd ?? null), id, now)
         const base = withAgent(
           { ...counted, jobTokens: counted.jobTokens + fresh, sessionTokens: counted.sessionTokens + fresh },
           id,
@@ -1617,7 +1779,9 @@ export const register: Register = (on, options) => {
             tokens: a.tokens + fresh,
           }),
         )
-        const r = withUsage(base, usage.rateLimits, id === 'main' ? usage.context.percent : undefined, now)
+        const r = usage
+          ? withUsage(base, usage.rateLimits, id === 'main' ? usage.context.percent : undefined, now)
+          : { next: base, alerts: [] }
         alerts = r.alerts
         return r.next
       })
@@ -1656,7 +1820,13 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? 'main'
     const now = await $.clock.now()
-    const usage = await $.session.usage()
+    // no reading (the engine refused): the agent still finishes, without this last reading
+    let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
+    try {
+      usage = await $.session.usage()
+    } catch {
+      // ignore
+    }
 
     let wasRunning = false
     let alerts: string[] = []
@@ -1664,7 +1834,10 @@ export const register: Register = (on, options) => {
       wasRunning = p.isRunning
       alerts = []
       // the last reading of this turn: limits (and the forecast) and the cost, before it ends
-      const r = withUsage(withLedger(withNow(p, now), usage.cost?.usd ?? null), usage.rateLimits, undefined, now)
+      const ended = withNow(p, now)
+      const r = usage
+        ? withUsage(withLedger(ended, usage.cost?.usd ?? null), usage.rateLimits, undefined, now)
+        : { next: ended, alerts: [] }
       const q = r.next
       // an agent already finished (the engine listed it so) keeps its frozen numbers; a helper
       // without a row (folded away, or never seen) is only counted, it gets no row
@@ -1688,7 +1861,7 @@ export const register: Register = (on, options) => {
       }
     }
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   // ── The engine measured the session (after a turn, or a limit moved a whole point) ─
   // Limits pushed from here feed the meters and the forecast too, between our own readings
@@ -1721,6 +1894,8 @@ export const register: Register = (on, options) => {
   // ── Band above the prompt: the "Usage Radar" card ────────────────────
   // Three lines: the header (with the account and the name), what's going on, and the meters
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // the layout: fullscreen docks the panel on the right, the main screen puts it above the prompt
+    if (typeof e.viewport?.isFullscreen === 'boolean') fullscreen = e.viewport.isFullscreen
     const p = await read($, live)
     const m = main(p)
     if (e.props.hasSurvey || !m) return next(e)
@@ -1831,19 +2006,22 @@ export const register: Register = (on, options) => {
         {shown.length > 0 && (
           <Box flexDirection="row" gap={3}>
             {shown.map(m => {
-              // the spend limit with its dollars: what's left (or over), no bar
+              // the spend limit with its dollars: what's left (or over), no bar; an old reading
+              // goes without its level colour, and says it's stale
               const l = m.spend ? spendLeft(m.spend) : null
               if (l) {
+                const tint = m.pct >= WARN && !m.stale ? levelColor(m.pct) : undefined
                 return (
                   <Text key={m.key}>
                     <Text dimColor>{m.label} </Text>
-                    <Text bold color={m.pct >= WARN ? levelColor(m.pct) : undefined}>
+                    <Text bold color={tint}>
                       {l.text}
                     </Text>
                     <Text dimColor>{` ${l.title.toLowerCase()} `}</Text>
-                    <Text bold color={m.pct >= WARN ? levelColor(m.pct) : undefined}>
+                    <Text bold color={tint}>
                       {levelText(m.pct)}
                     </Text>
+                    {m.stale && <Text dimColor>{STALE}</Text>}
                     {m.left !== null && <Text dimColor>{paceText(m)}</Text>}
                   </Text>
                 )
@@ -1907,6 +2085,71 @@ export const register: Register = (on, options) => {
     // what's left of the spend limit gets its own tile, when the panel is wide enough for four
     const left = p.spend && width >= 48 ? spendLeft(p.spend) : null
 
+    // one agent's row: main's is the session's totals minus its helpers'; a helper's its own (frozen once done)
+    const look = (a: Agent) => {
+      const isMain = a.id === 'main'
+      const isPaused = a.isRunning && a.pausedAt !== null
+      return {
+        isMain,
+        isPaused,
+        isDim: !isMain && !a.isRunning,
+        took: isMain ? sessionClock(p) : clock(agentMs(p, a)),
+        tokens: isMain ? mainTokens(p) : a.tokens,
+        cost: isMain ? mainCost(p) : agentCost(p, a),
+        icon: isPaused ? '⏸ ' : a.isRunning ? `${spinner(p.now)} ` : '✓ ',
+      }
+    }
+    const agents = [...(m ? [m] : []), ...rows.shown]
+
+    // Working or Done, how many agents and steps
+    const status = (
+      <Text>
+        <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
+        <Text bold>{p.isRunning ? 'Working' : 'Done'}</Text>
+        <Text dimColor>
+          {`  ·  ${plural(sessionAgents(p), 'agent')}${working ? `  ·  ${working} running` : ''}  ·  ${plural(p.sessionSteps, 'step')}`}
+        </Text>
+      </Text>
+    )
+
+    // above the prompt with less room than the whole panel needs: the totals on one line, then one
+    // line per agent, no tiles, gaps or Limits block, so it fits the room without scrolling
+    const room = e.props.scroll?.bodyRows
+    if (typeof room === 'number' && room > 0 && room < panelRows(p, cfg)) {
+      const sl = p.spend ? spendLeft(p.spend) : null
+      const cost = p.budget === null ? money(totalCost(p)) : budgetText(p)
+      const head = `Cost ${cost} · ${k(p.sessionTokens)} tokens · ${sessionClock(p)}${sl ? ` · ${sl.text} ${sl.title.toLowerCase()}` : ''}`
+      const shown = agents.slice(0, Math.max(1, room - 3))
+      const cut = agents.length - shown.length
+      const rest = [cut > 0 ? `+${cut} more` : '', more ?? ''].filter(Boolean).join('  ·  ')
+      return (
+        <Box flexDirection="column">
+          <Text bold>{fit(head, width)}</Text>
+          {status}
+          {agents.length === 0 && <Text dimColor>No agents yet. Send a prompt.</Text>}
+          {shown.map(a => {
+            const l = look(a)
+            const detail = `  ${k(l.tokens)} · ${l.took}${l.isPaused ? ' · idle' : ''}`
+            const price = money(l.cost)
+            const nameRoom = Math.max(6, width - l.icon.length - detail.length - price.length - 1)
+            return (
+              <Box key={a.id} flexDirection="row" justifyContent="space-between">
+                <Text>
+                  <Text color={l.isPaused ? AMBER : a.isRunning ? ORANGE : GREEN} dimColor={l.isDim}>{l.icon}</Text>
+                  <Text bold={!l.isDim} dimColor={l.isDim}>{fit(a.name, nameRoom)}</Text>
+                  <Text dimColor>{detail}</Text>
+                </Text>
+                <Text bold={!l.isDim} color={l.isDim ? undefined : AMBER} dimColor={l.isDim}>
+                  {price}
+                </Text>
+              </Box>
+            )
+          })}
+          {rest !== '' && <Text dimColor>{fit(rest, width)}</Text>}
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
@@ -1935,13 +2178,7 @@ export const register: Register = (on, options) => {
           {hasRequest(p) && <Text dimColor>{fit(lastRequest(p), width)}</Text>}
         </Box>
 
-        <Text>
-          <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
-          <Text bold>{p.isRunning ? 'Working' : 'Done'}</Text>
-          <Text dimColor>
-            {`  ·  ${plural(sessionAgents(p), 'agent')}${working ? `  ·  ${working} running` : ''}  ·  ${plural(p.sessionSteps, 'step')}`}
-          </Text>
-        </Text>
+        {status}
 
         {meters(p).length > 0 && (
           <Box flexDirection="column">
@@ -1975,7 +2212,9 @@ export const register: Register = (on, options) => {
                       {level}
                     </Text>
                   </Box>
-                  {m.spend && <Text dimColor>{fit(spendUsed(m.spend), width)}</Text>}
+                  {m.spend && (
+                    <Text dimColor>{fit(`${spendUsed(m.spend)}${m.stale ? ' · last read over 10m ago' : ''}`, width)}</Text>
+                  )}
                   <Text>
                     <Text color={levelColor(m.pct)}>{g.filled}</Text>
                     <Text dimColor>{g.empty}</Text>
@@ -1990,16 +2229,9 @@ export const register: Register = (on, options) => {
         {p.agents.length > 0 && <Text bold>Agents</Text>}
         {p.agents.length === 0 && <Text dimColor>No agents yet. Send a prompt.</Text>}
 
-        {[...(m ? [m] : []), ...rows.shown].map(a => {
-          // main's row: the session's totals minus its helpers'; a helper's: its own (frozen once done)
-          const isMain = a.id === 'main'
-          const isPaused = a.isRunning && a.pausedAt !== null
-          const isDim = !isMain && !a.isRunning
+        {agents.map(a => {
+          const { isPaused, isDim, took, tokens, cost, icon } = look(a)
           const b = bar(a.context / p.window, barWidth)
-          const took = isMain ? sessionClock(p) : clock(agentMs(p, a))
-          const tokens = isMain ? mainTokens(p) : a.tokens
-          const cost = isMain ? mainCost(p) : agentCost(p, a)
-          const icon = isPaused ? '⏸ ' : a.isRunning ? `${spinner(p.now)} ` : '✓ '
           return (
             <Box key={a.id} flexDirection="column">
               <Box flexDirection="row" justifyContent="space-between">
