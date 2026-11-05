@@ -2870,8 +2870,8 @@ test('a refused close: /radar says so, the panel stays open, and helpers still r
   const w = world(on)
   await withHelpers($, w, 1, true)
   w.closeDeny = true
-  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x.")
-  expect((await radarCmd($, 'close')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x.")
+  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x when it's docked.")
+  expect((await radarCmd($, 'close')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x when it's docked.")
   expect(w.panes.has(PANE_ID)).toBe(true)
   // not counted as closed by you: the next helper still opens (resizes) it
   const opens = w.openArgs.length

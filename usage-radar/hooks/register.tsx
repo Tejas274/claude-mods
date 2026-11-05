@@ -1761,7 +1761,7 @@ export const register: Register = (on, options) => {
         const replies = {
           closed: 'Usage Radar closed. /radar opens it again.',
           'not-open': "Usage Radar isn't open.",
-          refused: "Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x.",
+          refused: "Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x when it's docked.",
         }
         if (word === 'close') return { text: replies[await closePane($)] }
         if (word !== '' && word !== 'open') {
@@ -1812,7 +1812,7 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // ── You close the panel (its mark, Esc, or ctrl+x x once ctrl+x tab focused it): it stays closed until /radar ─
+  // ── You close the panel (Esc; docked, also its mark or ctrl+x tab then ctrl+x x): it stays closed until /radar ─
   on('ui.close', { id: PANE }, async ($, e, next) => {
     if (e.origin.kind === 'person') paneDismissed = true
     // a close by you or a plugin starts a session not started yet (its minute timer); the engine's
