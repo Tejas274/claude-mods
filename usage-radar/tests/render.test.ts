@@ -111,9 +111,17 @@ type Ui = {
 
 const DAY = 24 * 60 * 60 * 1000
 
-const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record<string, string> = {}) => {
+const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record<string, string> = {}, wiped = false) => {
+  // $.state as the host keeps it when `wiped`: a value and its version per key, all of it gone
+  // at w.wipe() (the host wipes it at every session end); otherwise the test kit's own
+  const held = new Map<string, { value: unknown; version: number }>()
   const w = {
     store: new Map<string, unknown>(Object.entries(seed)),
+    /** the host wipes $.state at session end (clearTo ends the session and wipes it) */
+    wiped,
+    wipe: () => held.clear(),
+    /** what the next tool.call waits for before it answers (each call takes the one set when it starts) */
+    toolHold: null as null | Promise<void>,
     sid: 's1',
     cost: 0,
     agents: [] as Array<Record<string, unknown>>,
@@ -130,8 +138,23 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     /** files $.fs.read finds (by path), and how many reads were asked for */
     files: {} as Record<string, string>,
     reads: 0,
-    /** the panes open now (by id) */
-    panes: new Set<string>(),
+    /** the panes open now (by id): placed (drawn) and shown (not a tab behind another) */
+    panes: new Map<string, { placed: boolean; shown: boolean }>(),
+    /** what the next ui.open answers: placed or waiting undrawn (with `reason`), shown or in a tab */
+    placed: true,
+    shown: true,
+    reason: 'waits for 144 columns (100 now)',
+    /** every ui.open's argument, every ui.close's origin, and ui.open refused */
+    openArgs: [] as any[],
+    closes: [] as string[],
+    openDeny: false,
+    /** ui.close refused */
+    closeDeny: false,
+    /** session.usage fails */
+    usageBroken: false,
+    /** command.register: how many calls fail first, and how many were asked */
+    registerFails: 0,
+    registers: 0,
     /** the login session.authorize answers (null: none, 'throw': it fails), and how often it was asked */
     auth: null as null | 'throw' | { handle: string; kind: 'bearer' | 'api-key' },
     authorized: 0,
@@ -142,10 +165,14 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     /** the requests $.http.fetch got and when, what it answers (null or 'deny': refused), and what it waits for first */
     fetches: [] as any[],
     fetchedAt: [] as number[],
-    reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string },
+    reply: null as null | 'deny' | 'throw' | { status: number; ok: boolean; text: string; headers?: Record<string, string> },
     hold: null as null | Promise<void>,
     /** the store fails every get and set */
     storeBroken: false,
+    /** the store refuses writes only (a full store, a write another process got in the way of) */
+    writeBroken: false,
+    /** what the next read of `private` waits for (it has read the value already: it lands late) */
+    privateReadHold: null as null | Promise<void>,
   }
   on('session.authorize', () => {
     w.authorized++
@@ -160,7 +187,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     if (w.hold) await w.hold
     if (reply === 'throw') throw new Error('network down')
     if (reply === null || reply === 'deny') return { deny: 'refused' } as never
-    return { value: { ...reply, headers: {} } } as never
+    return { value: { ...reply, headers: reply.headers ?? {} } } as never
   })
   mock.env(on, env)
   on('fs.read', (_$: any, e: any) => {
@@ -169,12 +196,18 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return (text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }) as never
   })
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }) as never)
-  on('store.get', (_$: any, e: any) => {
+  on('store.get', async (_$: any, e: any) => {
     if (w.storeBroken) throw new Error('store down')
-    return { value: w.store.get(e.key) } as never
+    const value = w.store.get(e.key)
+    const hold = e.key === 'private' ? w.privateReadHold : null
+    if (hold) {
+      w.privateReadHold = null
+      await hold
+    }
+    return { value } as never
   })
   on('store.set', (_$: any, e: any) => {
-    if (w.storeBroken) throw new Error('store down')
+    if (w.storeBroken || w.writeBroken) throw new Error('store down')
     w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined } as never
   })
@@ -185,6 +218,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
   on('store.keys', () => ({ value: [...w.store.keys()] }) as never)
   on('session.id', () => ({ value: w.sid }) as never)
   on('session.usage', async () => {
+    if (w.usageBroken) throw new Error('no usage')
     const value = { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: w.limits, cost: { usd: w.cost } }
     const f = w.onUsage
     w.onUsage = null
@@ -202,14 +236,31 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return { value: w.agents } as never
   })
   on('ui.open', (_$: any, e: any) => {
+    w.openArgs.push(e)
+    if (w.openDeny) return { deny: 'no panes here' } as never
     if (typeof e.rows === 'number') w.opened.push(e.rows)
-    w.panes.add(e.id)
-    return { value: { isPlaced: true } } as never
+    w.panes.set(e.id, { placed: w.placed, shown: w.shown })
+    return { value: w.placed ? { isPlaced: true } : { isPlaced: false, reason: w.reason } } as never
   })
-  on('ui.panes', () => ({ value: [...w.panes].map(id => ({ id, title: 'Usage Radar', isShown: true, isFocused: false, isPlaced: true })) }) as never)
+  on('ui.panes', () => ({
+    value: [...w.panes].map(([id, x]) => ({ id, title: 'Usage Radar', isShown: x.shown, isFocused: false, isPlaced: x.placed })),
+  }) as never)
+  on('ui.close', (_$: any, e: any) => {
+    if (w.closeDeny) return { deny: 'not now' } as never
+    w.panes.delete(e.id)
+    w.closes.push(e.origin?.kind)
+    return { value: undefined } as never
+  })
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', (_$: any, e: any) => { w.toasts.push(e.text); return { value: undefined } as never })
-  on('command.register', () => ({ value: { command: 'radar' } }) as never)
+  on('command.register', () => {
+    w.registers++
+    if (w.registerFails > 0) {
+      w.registerFails--
+      throw new Error('refused')
+    }
+    return { value: { command: 'radar' } } as never
+  })
   on('command.run', () => ({ text: '' }) as never)
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }) as never)
   on('session.end', (_$: any, e: any) => ({ sessionId: e.sessionId }) as never)
@@ -218,13 +269,39 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
   on('prompt.submit', (_$: any, e: any) => ({ text: e.text }) as never)
   on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
-  on('tool.call', () => ({ result: {} }) as never)
+  on('tool.call', async () => {
+    const hold = w.toolHold
+    if (hold) await hold
+    return { result: {} } as never
+  })
   on('turn.step', async function* (_$: any, e: any) {
     return { turnId: e.turnId, index: e.index, usage: w.next, stopReason: 'end_turn', answer: '', toolUses: [] }
   } as never)
+  if (wiped) {
+    const at = (e: any) => `${e.plugin}/${e.key}/${e.id ?? ''}`
+    on('state.get', (_$: any, e: any) => ({ value: held.get(at(e)) ?? { value: undefined, version: 0 } }) as never)
+    on('state.set', (_$: any, e: any) => {
+      const version = held.get(at(e))?.version ?? 0
+      if (e.ifVersion !== undefined && e.ifVersion !== version) return { value: { isSet: false, version } } as never
+      held.set(at(e), { value: JSON.parse(JSON.stringify(e.value)), version: version + 1 })
+      return { value: { isSet: true, version: version + 1 } } as never
+    })
+  }
   return w
 }
 type World = ReturnType<typeof world>
+
+// /clear (or another session taking its place): with a wiping host the session ends and its
+// $.state goes; then the engine answers the new id
+const clearTo = async ($: Engine, w: World, sid: string, reason = 'clear') => {
+  if (w.wiped) {
+    await $.session.end({ reason, sessionId: w.sid, resume: { id: w.sid } } as never)
+    w.wipe()
+  }
+  w.sid = sid
+}
+const MODES = [false, true] as const
+const mode = (wiped: boolean) => (wiped ? ' (the host wipes its state)' : '')
 
 // What a session does, step by step
 const prompt = ($: Engine, text: string, command?: { name: string; args: string }) =>
@@ -323,32 +400,34 @@ test('three prompts add up to session totals', async ($, on) => {
   await hidden(band($), /0 steps/)
 })
 
-test('a new session id starts at zero, and the old one comes back', async ($, on) => {
-  const w = world(on)
-  w.agents = [{ id: 'a1', description: 'Explore codebase', type: 'Explore', status: 'running' }]
-  await prompt($, 'first job')
-  await start($, 'm1')
-  w.cost = 0.30
-  await step($, w, 'm1', 100_000, 10_000)
-  await start($, 'h1', 'a1')
-  await step($, w, 'h1', 25_000, 5_000, 'a1')
-  await complete($, 'm1')
-  await complete($, 'h1', 'a1')
-  await shows(pane($), /^≈\$0\.30$/, /^140k$/, /2 agents/)
+for (const wiped of MODES) {
+  test(`a new session id starts at zero, and the old one comes back${mode(wiped)}`, async ($, on) => {
+    const w = world(on, {}, 0, {}, wiped)
+    w.agents = [{ id: 'a1', description: 'Explore codebase', type: 'Explore', status: 'running' }]
+    await prompt($, 'first job')
+    await start($, 'm1')
+    w.cost = 0.30
+    await step($, w, 'm1', 100_000, 10_000)
+    await start($, 'h1', 'a1')
+    await step($, w, 'h1', 25_000, 5_000, 'a1')
+    await complete($, 'm1')
+    await complete($, 'h1', 'a1')
+    await shows(pane($), /^≈\$0\.30$/, /^140k$/, /2 agents/)
 
-  // /clear: a new id, a ledger that starts over
-  w.sid = 's2'
-  w.cost = 0
-  await job($, w, 'after clear', 0.02, 5_000, 1_000)
-  await shows(pane($), /^≈\$0\.02$/, /^6k$/, /1 agent\b/, /Session total ≈\$0\.02/)
-  await hidden(pane($), /140k/)
+    // /clear: a new id, a ledger that starts over
+    await clearTo($, w, 's2')
+    w.cost = 0
+    await job($, w, 'after clear', 0.02, 5_000, 1_000)
+    await shows(pane($), /^≈\$0\.02$/, /^6k$/, /1 agent\b/, /Session total ≈\$0\.02/)
+    await hidden(pane($), /140k/)
 
-  // back to s1 (resume), its ledger at 0 again
-  w.sid = 's1'
-  w.cost = 0
-  await job($, w, 'resumed', 0.01, 1_000, 0)
-  await shows(pane($), /^≈\$0\.31$/, /^141k$/, /2 agents/)
-})
+    // back to s1 (resume), its ledger at 0 again
+    await clearTo($, w, 's1', 'resume')
+    w.cost = 0
+    await job($, w, 'resumed', 0.01, 1_000, 0)
+    await shows(pane($), /^≈\$0\.31$/, /^141k$/, /2 agents/)
+  })
+}
 
 for (const ledgerAtLoad of [0, 1]) {
   test(`resume continues saved totals (ledger ${ledgerAtLoad} at load)`, { options: { showName: true } }, async ($, on) => {
@@ -414,7 +493,7 @@ test('totals are saved while working, at the end of a session and of a job', asy
   expect(record(w)?.ms).toBe(20_000)
 })
 
-test('sessions unused for 90 days are pruned, other keys kept', async ($, on) => {
+test('sessions unused for 90 days are pruned, other keys and versions kept', async ($, on) => {
   const now = 400 * DAY
   const saved = (age: number) => ({
     v: 1, updatedAt: now - age, name: null, nameKind: null, cost: 0, tokens: 0, ms: 0, steps: 0, helperIds: [],
@@ -425,11 +504,14 @@ test('sessions unused for 90 days are pruned, other keys kept', async ($, on) =>
     'session:recent1': saved(10 * DAY),
     'session:recent2': saved(89 * DAY),
     'session:bad': 'garbage',
+    // another version's record: a shape we don't read, not a broken one
+    'session:v2': { v: 2, x: 1 },
     other: 'keep me',
   }, now)
   w.sid = 'new'
   await job($, w, 'hello', 0.01)
-  expect([...w.store.keys()].sort()).toEqual(['other', 'session:new', 'session:recent1', 'session:recent2'])
+  expect([...w.store.keys()].sort()).toEqual(['other', 'session:new', 'session:recent1', 'session:recent2', 'session:v2'])
+  expect(w.store.get('session:v2')).toEqual({ v: 2, x: 1 })
   expect(w.store.get('other')).toBe('keep me')
 })
 
@@ -505,6 +587,11 @@ const NAMES: Array<[string, string, string]> = [
   ['fix WEB-01 and CI-CD in prod', 'fix WEB-01 and CI-CD in', 'words'],
   ['open docs/browse/ABC-1.md and fix', 'open docs/browse/ABC-1.md and fix', 'words'],
   ['upgrade ruby-3.2 and node-18.1 then vue-3.4', 'upgrade ruby-3.2 and node-18.1 then', 'words'],
+  ['rotate the API-KEY now', 'rotate the API-KEY now', 'words'],
+  ['READ-ONLY mode', 'READ-ONLY mode', 'words'],
+  ['NON-NULL fields', 'NON-NULL fields', 'words'],
+  ['API-123 fix', 'API-123', 'ticket'],
+  ['see https://x.atlassian.net/browse/API-12', 'API-12', 'ticket'],
 ]
 
 test('the first prompt names the session', { options: { showName: true } }, async ($, on) => {
@@ -751,29 +838,31 @@ test('helpers past the 8 rows share one "+N earlier agents" line', async ($, on)
   expect(record(w)?.earlier).toMatchObject({ agents: 2, tokens: 2_000 })
 })
 
-test('resume brings the session\'s agents back; another session has none', async ($, on) => {
-  const now = 400 * DAY
-  const agent = { id: 'x1', name: 'researcher · Find config', model: 'claude-opus-5-5', cost: 0.42, tokens: 12_000, ms: 65_000, endedAt: now - DAY }
-  const w = world(on, {
-    'session:s1': {
-      v: 1, updatedAt: now - DAY, name: 'old work', nameKind: 'words',
-      cost: 1, tokens: 50_000, ms: 600_000, steps: 4, helperIds: ['x1'],
-      // a bad entry is dropped, the rest of the record still loads
-      agents: [agent, { id: 3 }, 'junk', { ...agent, id: 'x2', tokens: -1 }],
-    },
-  }, now)
-  await job($, w, 'more', 0.05)
-  await shows(pane($), /^researcher · Find config$/, /^≈\$0\.42$/, /12k · 1:05$/, /^≈\$1\.05$/, /2 agents/)
-  await hidden(pane($), /earlier agent/)
-  expect(record(w)?.agents).toMatchObject([{ id: 'x1', cost: 0.42, tokens: 12_000, ms: 65_000 }])
+for (const wiped of MODES) {
+  test(`resume brings the session's agents back; another session has none${mode(wiped)}`, async ($, on) => {
+    const now = 400 * DAY
+    const agent = { id: 'x1', name: 'researcher · Find config', model: 'claude-opus-5-5', cost: 0.42, tokens: 12_000, ms: 65_000, endedAt: now - DAY }
+    const w = world(on, {
+      'session:s1': {
+        v: 1, updatedAt: now - DAY, name: 'old work', nameKind: 'words',
+        cost: 1, tokens: 50_000, ms: 600_000, steps: 4, helperIds: ['x1'],
+        // a bad entry is dropped, the rest of the record still loads
+        agents: [agent, { id: 3 }, 'junk', { ...agent, id: 'x2', tokens: -1 }],
+      },
+    }, now, {}, wiped)
+    await job($, w, 'more', 0.05)
+    await shows(pane($), /^researcher · Find config$/, /^≈\$0\.42$/, /12k · 1:05$/, /^≈\$1\.05$/, /2 agents/)
+    await hidden(pane($), /earlier agent/)
+    expect(record(w)?.agents).toMatchObject([{ id: 'x1', cost: 0.42, tokens: 12_000, ms: 65_000 }])
 
-  // /clear: a new session starts with no agents (and its ledger at 0)
-  w.sid = 's2'
-  w.cost = 0
-  await job($, w, 'fresh', 0.01)
-  await hidden(pane($), /researcher/)
-  expect(record(w)?.agents).toEqual([])
-})
+    // /clear: a new session starts with no agents (and its ledger at 0)
+    await clearTo($, w, 's2')
+    w.cost = 0
+    await job($, w, 'fresh', 0.01)
+    await hidden(pane($), /researcher/)
+    expect(record(w)?.agents).toEqual([])
+  })
+}
 
 test('a 2.1.0 record without agents still loads', { options: { showName: true } }, async ($, on) => {
   const now = 400 * DAY
@@ -891,7 +980,8 @@ const height = (el: any): number => {
 const radar = ($: Engine) =>
   $.command.run({ command: 'radar', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as never)
 const fits = async ($: Engine, w: World) => {
-  await radar($)
+  // /radar open, not /radar: a bare /radar closes the panel when it is open
+  await radarCmd($, 'open')
   const ui: any = await pane($)
   expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
   await ui.unmount()
@@ -1126,29 +1216,31 @@ test('resume keeps the budget and the warnings already shown', async ($, on) => 
   expect(record(w)).toMatchObject({ budget: 1, budgetFired: 100 })
 })
 
-test('/clear keeps the budget, its spend and warnings start over; resume keeps its own', async ($, on) => {
-  const w = world(on)
-  await radarCmd($, 'budget 1')
-  await job($, w, 'go', 0.90)
-  expect(w.toasts.filter(t => /Budget/.test(t))).toEqual(['⚠ Budget 80% used · ≈$0.90 / $1.00'])
+for (const wiped of MODES) {
+  test(`/clear keeps the budget, its spend and warnings start over; resume keeps its own${mode(wiped)}`, async ($, on) => {
+    const w = world(on, {}, 0, {}, wiped)
+    await radarCmd($, 'budget 1')
+    await job($, w, 'go', 0.90)
+    expect(w.toasts.filter(t => /Budget/.test(t))).toEqual(['⚠ Budget 80% used · ≈$0.90 / $1.00'])
 
-  // /clear: a new id with no record
-  w.sid = 's2'
-  w.cost = 0
-  await job($, w, 'fresh', 0.10)
-  await shows(band($), exactly('≈$0.10 / $1.00'))
-  await job($, w, 'fresh', 0.85)
-  expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
-  expect(record(w, 's2')).toMatchObject({ budget: 1, budgetFired: 80 })
+    // /clear: a new id with no record
+    await clearTo($, w, 's2')
+    w.cost = 0
+    await job($, w, 'fresh', 0.10)
+    await shows(band($), exactly('≈$0.10 / $1.00'))
+    await job($, w, 'fresh', 0.85)
+    expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
+    expect(record(w, 's2')).toMatchObject({ budget: 1, budgetFired: 80 })
 
-  // back to s1: its own record
-  w.sid = 's1'
-  w.cost = 0
-  await job($, w, 'back', 0)
-  await shows(band($), exactly('≈$0.90 / $1.00'))
-  expect(record(w, 's1')).toMatchObject({ budget: 1, budgetFired: 80 })
-  expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
-})
+    // back to s1: its own record
+    await clearTo($, w, 's1', 'resume')
+    w.cost = 0
+    await job($, w, 'back', 0)
+    await shows(band($), exactly('≈$0.90 / $1.00'))
+    expect(record(w, 's1')).toMatchObject({ budget: 1, budgetFired: 80 })
+    expect(w.toasts.filter(t => /Budget/.test(t)).length).toBe(2)
+  })
+}
 
 test('/radar budget: show, bad amounts, lowering below the spend, off, $2', async ($, on) => {
   const w = world(on)
@@ -1499,6 +1591,7 @@ const NO_SPEND: Array<[string, (w: World) => void, number]> = [
   ['the request is refused', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'deny' }, 1],
   ['the request throws', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = 'throw' }, 1],
   ['a 401', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = { status: 401, ok: false, text: '{"error":"unauthorized"}' } }, 1],
+  ['a 429', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = { status: 429, ok: false, text: '' } }, 1],
   ['an answer that is not JSON', w => { w.auth = { handle: 'h', kind: 'bearer' }; w.reply = ok('not json') }, 1],
   ['no spend block', w => spendOn(w, { five_hour: null, seven_day: null, spend: null, extra_usage: null }), 1],
   ['both turned off', w => spendOn(w, { spend: { ...SPEND(1, 2).spend, enabled: false }, extra_usage: { ...SPEND(1, 2).extra_usage, is_enabled: false } }), 1],
@@ -1546,14 +1639,14 @@ test('over the limit: how much over, and ⛔', async ($, on) => {
   expect(await color(pane($), exactly('$3.50'))).toBe('error')
 })
 
-test('a failed check keeps the last reading; the third in a row drops it', async ($, on) => {
+test('a refused check (401) keeps the last reading; the third in a row drops it', async ($, on) => {
   const w = world(on)
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
   await job($, w, 'go', 0.01)
   await shows(pane($), /\$12\.40/)
   const toasts = w.toasts.length
-  w.reply = { status: 500, ok: false, text: '' }
+  w.reply = { status: 401, ok: false, text: '' }
   await w.clock.advance(60_000)
   await shows(pane($), /\$12\.40/)
   await w.clock.advance(60_000)
@@ -1561,7 +1654,7 @@ test('a failed check keeps the last reading; the third in a row drops it', async
   // a good answer in between starts the count over
   spendOn(w, SPEND(1240, 10000))
   await w.clock.advance(60_000)
-  w.reply = { status: 500, ok: false, text: '' }
+  w.reply = { status: 401, ok: false, text: '' }
   await w.clock.advance(60_000)
   await w.clock.advance(60_000)
   await shows(pane($), /\$12\.40/)
@@ -1852,25 +1945,28 @@ test('private mode is loaded even without session.start', { options: LABELS }, a
   await hidden(pane($), /gmail/)
 })
 
-test('session.end lets the next session start again', async ($, on) => {
-  const w = world(on)
-  spendOn(w, SPEND(1240, 10000))
-  await prompt($, 'go')
-  await w.clock.advance(0)
-  expect(w.fetches.length).toBe(1)
-  await $.session.end({ sessionId: 's1', reason: 'other' } as never)
-  await w.clock.advance(120_000)
-  expect(w.fetches.length).toBe(1)
-  // /clear: a new session, and no session.start again
-  w.sid = 's2'
-  await prompt($, 'next')
-  await w.clock.advance(0)
-  expect(w.fetches.length).toBe(2)
-  const s = w.surfaced
-  await w.clock.advance(60_000)
-  expect(w.fetches.length).toBe(3)
-  expect(w.surfaced - s).toBe(1)
-})
+for (const wiped of MODES) {
+  test(`session.end lets the next session start again${mode(wiped)}`, async ($, on) => {
+    const w = world(on, {}, 0, {}, wiped)
+    spendOn(w, SPEND(1240, 10000))
+    await prompt($, 'go')
+    await w.clock.advance(0)
+    expect(w.fetches.length).toBe(1)
+    await $.session.end({ sessionId: 's1', reason: wiped ? 'clear' : 'other' } as never)
+    if (wiped) w.wipe()
+    await w.clock.advance(120_000)
+    expect(w.fetches.length).toBe(1)
+    // /clear: a new session, and no session.start again
+    w.sid = 's2'
+    await prompt($, 'next')
+    await w.clock.advance(0)
+    expect(w.fetches.length).toBe(2)
+    const s = w.surfaced
+    await w.clock.advance(60_000)
+    expect(w.fetches.length).toBe(3)
+    expect(w.surfaced - s).toBe(1)
+  })
+}
 
 test('showSpend off without session.start: no request at all', { options: { showSpend: false } }, async ($, on) => {
   const w = world(on)
@@ -2355,8 +2451,8 @@ for (const budget of [false, true]) {
 // ════════════════════════════════════════════════════════════════════════════
 const HINT_TEXT = /^ ?\(\/radar private to hide\)$/
 // a work account in ~/.claude.json (a made-up address)
-const workWorld = (on: any, seed: Record<string, unknown> = {}, email = 'you@work.example.com') => {
-  const w = world(on, seed, 0, { HOME: '/Users/t' })
+const workWorld = (on: any, seed: Record<string, unknown> = {}, email = 'you@work.example.com', wiped = false) => {
+  const w = world(on, seed, 0, { HOME: '/Users/t' }, wiped)
   w.files['/Users/t/.claude.json'] = account(email)
   return w
 }
@@ -2459,19 +2555,21 @@ test('/radar private with the panel closed opens nothing', { options: LABELS }, 
   expect(w.opened.length).toBe(0)
 })
 
-test('private mode stays on in a new process and a new session', { options: LABELS }, async ($, on) => {
-  const w = workWorld(on, { private: true })
-  await begin($, w)
-  await job($, w, 'DEMO-142 fix the login', 0.01)
-  await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
-  await hidden(pane($), /@/, /DEMO-142/)
-  // /clear: a new session id keeps it
-  w.sid = 's2'
-  w.cost = 0
-  await job($, w, 'DEMO-7 another thing', 0.01)
-  await hidden(pane($), /@/, /DEMO-7/)
-  expect(record(w)?.name).toBe('DEMO-7')
-})
+for (const wiped of MODES) {
+  test(`private mode stays on in a new process and a new session${mode(wiped)}`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on, { private: true }, 'you@work.example.com', wiped)
+    await begin($, w)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    await hidden(band($, 160), /@/, /DEMO-142/, /radar private/)
+    await hidden(pane($), /@/, /DEMO-142/)
+    // /clear: a new session id keeps it
+    await clearTo($, w, 's2')
+    w.cost = 0
+    await job($, w, 'DEMO-7 another thing', 0.01)
+    await hidden(pane($), /@/, /DEMO-7/)
+    expect(record(w)?.name).toBe('DEMO-7')
+  })
+}
 
 test('a stored private value that is not true counts as off', { options: LABELS }, async ($, on) => {
   const w = workWorld(on, { private: 'yes' })
@@ -2480,17 +2578,19 @@ test('a stored private value that is not true counts as off', { options: LABELS 
   await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
 })
 
-test('private mode set in one session carries to the next', { options: LABELS }, async ($, on) => {
-  const w = workWorld(on)
-  await begin($, w)
-  await job($, w, 'DEMO-142 fix the login', 0.01)
-  await radarCmd($, 'private')
-  w.sid = 's2'
-  w.cost = 0
-  await job($, w, 'DEMO-7 another thing', 0.01)
-  await hidden(band($, 160), /@/, /DEMO-7/)
-  await hidden(pane($), /@/, /DEMO-7/)
-})
+for (const wiped of MODES) {
+  test(`private mode set in one session carries to the next${mode(wiped)}`, { options: LABELS }, async ($, on) => {
+    const w = workWorld(on, {}, 'you@work.example.com', wiped)
+    await begin($, w)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    await radarCmd($, 'private')
+    await clearTo($, w, 's2')
+    w.cost = 0
+    await job($, w, 'DEMO-7 another thing', 0.01)
+    await hidden(band($, 160), /@/, /DEMO-7/)
+    await hidden(pane($), /@/, /DEMO-7/)
+  })
+}
 
 test('the store only keeps sessions and the private boolean, never the email', { options: LABELS }, async ($, on) => {
   const w = workWorld(on)
@@ -2627,4 +2727,996 @@ test('a broken store: private mode starts off, and /radar private still hides th
   await hidden(band($, 160), /@/, /DEMO-142/)
   await hidden(pane($), /@/, /DEMO-142/)
   await shows(pane($), exactly('[WORK]'))
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.2: the panel on every terminal, the spend check backing off, helpers that end unheard
+// ════════════════════════════════════════════════════════════════════════════
+const PANE_ID = 'radar-agents'
+// The pane seated inline above the prompt with `bodyRows` rows of room
+const inlinePane = ($: Engine, bodyRows: number): Promise<Ui> => $.ui.mount({
+  plugin: 'usage-radar', surface: 'terminal', component: 'Pane', requestId: PANE_ID,
+  props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'inline', scroll: { offset: 0, bodyRows } } as never,
+})
+// The band on a terminal that says its layout
+const bandIn = ($: Engine, isFullscreen: boolean): Promise<Ui> => $.ui.mount({
+  plugin: 'usage-radar', surface: 'terminal', component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100 } as never,
+  viewport: { columns: 160, rows: 40, isFullscreen },
+} as never)
+const radarAt = ($: Engine, args: string, presentation: { isFullscreen: boolean; columns: number }) =>
+  $.command.run({ command: 'radar', args, origin: { kind: 'composer' }, presentation } as never) as Promise<{ text?: string }>
+const helper = (n: number, status = 'running') => ({ id: `a${n}`, description: `Task ${n}`, type: 'Explore', status })
+// autoOpen on: a helper starting opens the panel on its own in fullscreen (it's off by default)
+const AUTO_OPEN = { options: { autoOpen: true } }
+
+// A job with main working, then `n` helpers starting (the panel opens on its own with autoOpen,
+// once the band has said the layout is fullscreen)
+const withHelpers = async ($: Engine, w: World, n: number, fullscreen = false) => {
+  w.agents = Array.from({ length: n }, (_, i) => helper(i + 1))
+  await prompt($, 'go')
+  await start($, 'm')
+  if (fullscreen) await shows(bandIn($, true), /Usage Radar/)
+  w.cost = 0.10
+  await step($, w, 'm', 1_000, 0)
+  for (let i = 1; i <= n; i++) await start($, `h${i}`, `a${i}`)
+  await w.clock.advance(0)
+}
+const drawnHeight = async (mount: Promise<Ui>) => {
+  const ui: any = await mount
+  const h = height(await ui.drawn())
+  await ui.unmount()
+  return h
+}
+
+test('/radar opens the panel, closes it when it shows, and opens it again', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, '')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.closes).toEqual(['plugin'])
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('/radar open never closes; /radar close closes, and says when nothing is open', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  expect((await radarCmd($, 'open')).text).toMatch(/^Usage Radar opened/)
+  expect(w.closes).toEqual([])
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, 'close')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, 'close')).text).toBe("Usage Radar isn't open.")
+})
+
+test('every open asks for Esc to close the panel: /radar, a helper starting, a resize', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1, true)
+  await radarCmd($, 'budget 1')
+  await radarCmd($, 'open')
+  expect(w.openArgs.length).toBeGreaterThanOrEqual(3)
+  expect(w.openArgs.every(a => a.closeOnEscape === true)).toBe(true)
+})
+
+// (the test kit can't raise the person's own close, its mark or Esc: a bare /radar closes it here)
+test('closed with /radar: helpers starting leave it closed until /radar opens it again', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1, true)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  expect((await radarCmd($, '')).text).toBe('Usage Radar closed. /radar opens it again.')
+  expect(w.closes).toEqual(['plugin'])
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2), helper(3)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  await start($, 'h3', 'a3')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 2)
+})
+
+test('after /radar close, the next helper does not open it again', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1)
+  await radarCmd($, 'close')
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+})
+
+test('a panel open but not drawn yet: /radar draws it, it does not close it', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  w.placed = false
+  await withHelpers($, w, 1, true)
+  expect(w.panes.get(PANE_ID)).toEqual({ placed: false, shown: true })
+  w.placed = true
+  expect((await radarCmd($, '')).text).toMatch(/^Usage Radar opened/)
+  expect(w.closes).toEqual([])
+  expect(w.panes.get(PANE_ID)).toEqual({ placed: true, shown: true })
+})
+
+test('a panel in a tab behind another: /radar brings it, and says how to show it', async ($, on) => {
+  const w = world(on)
+  w.shown = false
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  const text = (await radarCmd($, '')).text
+  expect(text).toMatch(/^Usage Radar opened/)
+  expect(text).toContain('ctrl+x tab')
+  expect(w.closes).toEqual([])
+})
+
+test('/radar says why the panel is not drawn, and a refused open gets a reply too', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  w.placed = false
+  expect((await radarCmd($, '')).text).toBe('Usage Radar is open but not drawn here yet: waits for 144 columns (100 now)')
+  w.panes.clear()
+  w.openDeny = true
+  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't open its panel here.")
+})
+
+test('a refused close: /radar says so, the panel stays open, and helpers still resize it', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 1, true)
+  w.closeDeny = true
+  expect((await radarCmd($, '')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x when it's docked.")
+  expect((await radarCmd($, 'close')).text).toBe("Usage Radar couldn't close its panel here. Press Esc at an empty prompt, or ctrl+x tab then ctrl+x x when it's docked.")
+  expect(w.panes.has(PANE_ID)).toBe(true)
+  // not counted as closed by you: the next helper still opens (resizes) it
+  const opens = w.openArgs.length
+  w.agents = [helper(1), helper(2)]
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 1)
+})
+
+test('/radar with anything else: a usage reply, nothing opens', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  const text = (await radarCmd($, 'foo')).text ?? ''
+  for (const word of ['/radar open', '/radar close', '/radar budget', '/radar private']) expect(text).toContain(word)
+  expect(w.openArgs.length).toBe(0)
+})
+
+test('on the main screen a helper does not open the panel, even with autoOpen; /radar still does', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(bandIn($, false), /Usage Radar/)
+  w.agents = [helper(1)]
+  await start($, 'h1', 'a1')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(0)
+  expect((await radarAt($, '', { isFullscreen: false, columns: 160 })).text).toMatch(/^Usage Radar opened above the prompt/)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('in fullscreen a helper opens the panel', AUTO_OPEN, async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(bandIn($, true), /Usage Radar/)
+  w.agents = [helper(1)]
+  await start($, 'h1', 'a1')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(1)
+  expect(w.panes.has(PANE_ID)).toBe(true)
+})
+
+test('/radar says the panel is above the prompt, unless fullscreen docks it', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  expect((await radarAt($, 'open', { isFullscreen: false, columns: 100 })).text).toContain('above the prompt')
+  expect((await radarAt($, 'open', { isFullscreen: true, columns: 100 })).text).toContain('above the prompt')
+  const docked = (await radarAt($, 'open', { isFullscreen: true, columns: 160 })).text
+  expect(docked).not.toContain('above the prompt')
+  expect(docked).toMatch(/^Usage Radar opened\. Close it with \/radar, \/radar close or Esc\.$/)
+})
+
+test('a short room above the prompt: one line per agent, no Limits, never taller than the room', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(30), seven(11)]
+  await withHelpers($, w, 3)
+  expect(await drawnHeight(inlinePane($, 8))).toBeLessThanOrEqual(8)
+  await shows(inlinePane($, 8), /^Main/, /Explore · Task 1/, /Explore · Task 2/, /Explore · Task 3/)
+  await hidden(inlinePane($, 8), /^Limits$/)
+  // plenty of room: the whole panel
+  await shows(inlinePane($, 200), /^Limits$/, /^5h limit/)
+})
+
+test('a short room with ten helpers: the first rows, then one +N more line', async ($, on) => {
+  const w = world(on)
+  await withHelpers($, w, 10)
+  expect(await drawnHeight(inlinePane($, 6))).toBeLessThanOrEqual(6)
+  await shows(inlinePane($, 6), /^\+\d+ more/)
+})
+
+// ── The spend check backing off ─────────────────────────────────────────
+const busyReply = (status: number, retryAfter?: string) =>
+  ({ status, ok: false, text: '', ...(retryAfter !== undefined && { headers: { 'retry-after': retryAfter } }) })
+// Advance in 10 s steps until the next request (at most `maxMs`); the gap since the one before
+const nextGap = async (w: World, maxMs: number): Promise<number> => {
+  const n = w.fetches.length
+  const from = w.clock.now()
+  while (w.fetches.length === n && w.clock.now() - from < maxMs) await w.clock.advance(10_000)
+  expect(w.fetches.length, `a request within ${maxMs} ms`).toBe(n + 1)
+  return (w.fetchedAt.at(-1) ?? 0) - (w.fetchedAt.at(-2) ?? 0)
+}
+// A reading of $12.40, then Anthropic answering `reply` from the next minute's check on
+const heldBack = async ($: Engine, w: World, reply: ReturnType<typeof busyReply>) => {
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$12\.40/)
+  w.reply = reply
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+}
+
+test('a 429 waits as Retry-After asks, keeps the reading, and never resizes the panel', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await radarCmd($, 'open')
+  const opened = w.opened.length
+  w.reply = busyReply(429, '300')
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(299_000)
+  expect(w.fetches.length).toBe(2)
+  for (let i = 0; i < 10; i++) {
+    const gap = await nextGap(w, 400_000)
+    expect(gap).toBeGreaterThanOrEqual(300_000)
+    expect(gap).toBeLessThanOrEqual(300_000 * 1.1 + 60_000)
+  }
+  await shows(pane($), /\$12\.40/)
+  expect(w.opened.length).toBe(opened)
+})
+
+test('a Retry-After date is waited for too', async ($, on) => {
+  const w = world(on)
+  // the 429 comes at the minute's check: wait until 3 minutes after it
+  await heldBack($, w, busyReply(429, new Date(60_000 + 180_000).toUTCString()))
+  const gap = await nextGap(w, 400_000)
+  expect(gap).toBeGreaterThanOrEqual(180_000)
+  expect(gap).toBeLessThanOrEqual(180_000 * 1.1 + 60_000)
+})
+
+for (const [label, retryAfter, least] of [['a second', '1', 60_000], ['a day', '86400', 15 * 60_000]] as const) {
+  test(`Retry-After of ${label} waits between a minute and 15 minutes`, { timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on)
+    await heldBack($, w, busyReply(429, retryAfter))
+    const gap = await nextGap(w, 20 * 60_000)
+    expect(gap).toBeGreaterThanOrEqual(least)
+    expect(gap).toBeLessThanOrEqual(least * 1.1 + 60_000)
+  })
+}
+
+test('without Retry-After each wait doubles to 15 minutes, and a good answer goes back to once a minute', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429))
+  for (const least of [120_000, 240_000, 480_000, 900_000]) {
+    const gap = await nextGap(w, 20 * 60_000)
+    expect(gap).toBeGreaterThanOrEqual(least)
+    expect(gap).toBeLessThanOrEqual(least * 1.1 + 60_000)
+  }
+  spendOn(w, SPEND(1300, 10000))
+  await nextGap(w, 20 * 60_000)
+  await shows(pane($), /\$13 of \$100 used/)
+  expect(await nextGap(w, 120_000)).toBe(60_000)
+})
+
+for (const status of [500, 503]) {
+  test(`a ${status} backs off like a 429 and keeps the reading`, { timeoutMs: 30_000 }, async ($, on) => {
+    const w = world(on)
+    await heldBack($, w, busyReply(status))
+    await w.clock.advance(60_000)
+    expect(w.fetches.length).toBe(2)
+    await w.clock.advance(15 * 60_000)
+    await shows(pane($), /\$12\.40/)
+  })
+}
+
+test('prompts and measures while held back make no request', async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '600'))
+  for (let t = 0; t < 5 * 60_000; t += 30_000) {
+    await w.clock.advance(30_000)
+    await measure($, [])
+    await prompt($, 'more')
+  }
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(2)
+})
+
+test('a reading over 10 minutes old says stale, in the band and the panel, until a good answer', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '300'))
+  await hidden(band($), /stale/)
+  await w.clock.advance(10 * 60_000)
+  await shows(band($), exactly(' · stale'))
+  await shows(pane($), /^\$12\.40 of \$100 used · last read over 10m ago$/)
+  // the meters still fit the band
+  const lines = await bandLines($, 100)
+  expect(columns(lines[2])).toBeLessThanOrEqual(96)
+  spendOn(w, SPEND(1240, 10000))
+  await nextGap(w, 400_000)
+  await hidden(band($), /stale/)
+  await hidden(pane($), /last read/)
+})
+
+test('another account while held back: the old dollars go at the next tick, the new account is read', async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
+  await heldBack($, w, busyReply(429, '900'))
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(5000, 10000))
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(3)
+  await hidden(pane($), /\$12\.40/)
+  await shows(pane($), /\$50 of \$100 used/)
+  // the old account's wait is gone for every session
+  expect(w.store.has('spend-hold')).toBe(false)
+})
+
+test('backing off keeps no dollars in the store, only when to ask again', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
+  await heldBack($, w, busyReply(429, '300'))
+  await w.clock.advance(10 * 60_000)
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private' || key === 'spend-hold')).toBe(true)
+  const hold = w.store.get('spend-hold') as Record<string, unknown>
+  expect(Object.keys(hold).sort()).toEqual(['backoffs', 'until'])
+  expect(typeof hold.until).toBe('number')
+  expect(typeof hold.backoffs).toBe('number')
+  const all = JSON.stringify([...w.store.entries()])
+  expect(all).not.toContain('12.4')
+  expect(all).not.toContain('@')
+  expect(all).not.toContain('stale')
+})
+
+// ── Helpers that end without a word, and readings that fail ─────────────
+test('a helper the list showed and then dropped has ended: the job ends after 30 s', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await start($, 'h1', 'a1')
+  await step($, w, 'h1', 2_000, 0, 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+  w.agents = []
+  await w.clock.advance(20_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await w.clock.advance(11_000)
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+  await hidden(band($), /Waiting for 1 helper/)
+  // the clock stands still
+  const time = async () => {
+    const ui = await pane($)
+    const t = (await ui.find({ type: 'Text', text: /^\d+:\d\d$/ }))?.text
+    await ui.unmount()
+    return t
+  }
+  const was = await time()
+  await w.clock.advance(30_000)
+  expect(await time()).toBe(was)
+  // the next prompt is a new job: its last request counts only its own tokens
+  await prompt($, 'next')
+  await start($, 'm2')
+  await step($, w, 'm2', 5_000, 0)
+  await shows(pane($), /^last request .* · 5k tokens · /)
+})
+
+test('a helper never listed (a workflow\'s) keeps running until its turn.complete', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await start($, 'h1', 'a1')
+  await complete($, 'm')
+  await w.clock.advance(120_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await shows(pane($), /1 running/)
+  await complete($, 'h1', 'a1')
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+})
+
+test('a helper missing from the list for 10 s, then listed again, still runs', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h1', 'a1')
+  await complete($, 'm')
+  await w.clock.advance(2_000)
+  w.agents = []
+  await w.clock.advance(10_000)
+  w.agents = [helper(1)]
+  await w.clock.advance(40_000)
+  expect(w.toasts.some(t => t.includes('All done'))).toBe(false)
+  await shows(pane($), /1 running/)
+})
+
+test('without a usage reading a job still starts, counts its tokens and ends', async ($, on) => {
+  const w = world(on)
+  w.usageBroken = true
+  await prompt($, 'go')
+  await start($, 'm')
+  await shows(pane($), exactly('Working'))
+  await step($, w, 'm', 5_000, 0)
+  await shows(pane($), exactly('5k'))
+  await tool($)
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toContain('✓ All done')
+  await shows(pane($), exactly('Done'))
+})
+
+test('a refused /radar registration is tried again at the next prompt, with one spend timer', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  w.registerFails = 1
+  await begin($, w)
+  expect(w.registers).toBe(1)
+  expect(w.fetches.length).toBe(1)
+  await prompt($, 'go')
+  await w.clock.advance(0)
+  expect(w.registers).toBe(2)
+  await prompt($, 'more')
+  await w.clock.advance(0)
+  expect(w.registers).toBe(2)
+  const fetches = w.fetches.length
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(fetches + 1)
+})
+
+test('a session that ends while it starts starts no spend timer', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  w.onUsage = async () => { await $.session.end({ sessionId: 's1', reason: 'other' } as never) }
+  await begin($, w)
+  await w.clock.advance(300_000)
+  expect(w.fetches.length).toBe(0)
+})
+
+// ── Numbers ─────────────────────────────────────────────────────────────
+test('999,600 tokens read 1.0M, never 1000k', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01, 999_600)
+  await shows(band($), exactly('1.0M'))
+  await hidden(band($), /1000k/)
+})
+
+test('a reset under a minute away reads <1m', async ($, on) => {
+  const w = world(on)
+  w.limits = [five(50, 20_000)]
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /resets in <1m/)
+  await hidden(pane($), /resets in 0m/)
+})
+
+test('a context percent that is not a number is left out', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  await $.session.measure({ context: { window: 200_000, percent: NaN }, rateLimits: [], changed: ['context'] } as never)
+  await hidden(band($), /NaN/)
+  await hidden(pane($), /NaN/)
+  await shows(pane($), /^Context/)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.3: the hooks keep their own results, the forecast, autoOpen, other versions' records,
+// what carries over a wiped state, private mode and the spend wait shared between sessions
+// ════════════════════════════════════════════════════════════════════════════
+test('a tallying failure after the real tool ran never re-runs the tool', async ($, on) => {
+  mock.clock(on)
+  let toolCalls = 0
+  on('tool.call', async () => {
+    toolCalls++
+    return { result: { stdout: 'ok' } } as never
+  })
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('state.set', () => {
+    throw new Error('store unavailable')
+  })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'echo hi' } as never)
+  expect(toolCalls).toBe(1)
+  // the real tool's result still reaches the caller
+  expect((ran as any).result?.stdout).toBe('ok')
+})
+
+test('a tallying failure only after the tool ran: the tool runs once, its result comes back', async ($, on) => {
+  mock.clock(on)
+  let toolCalls = 0
+  on('tool.call', async () => {
+    toolCalls++
+    return { result: { stdout: 'ok' } } as never
+  })
+  on('ui.status', () => ({ value: undefined }) as never)
+  // the count before the tool lands; the write after it fails
+  let sets = 0
+  on('state.set', (_$: any, e: any, next: any) => {
+    sets++
+    if (sets === 2) throw new Error('store unavailable')
+    return next(e)
+  })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'echo hi' } as never)
+  expect(sets).toBeGreaterThanOrEqual(2)
+  expect(toolCalls).toBe(1)
+  expect((ran as any).result?.stdout).toBe('ok')
+})
+
+test('a tallying failure in turn.step hands back the step\'s own result; the model step runs once', async ($, on) => {
+  mock.clock(on)
+  let steps = 0
+  on('turn.step', async function* (_$: any, e: any) {
+    steps++
+    return { turnId: e.turnId, index: e.index, usage: usage(1_000, 10), stopReason: 'end_turn', answer: 'hi', toolUses: [] }
+  } as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('state.set', () => {
+    throw new Error('store unavailable')
+  })
+  const gen: any = $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)
+  let r = await gen.next()
+  while (!r.done) r = await gen.next()
+  expect(steps).toBe(1)
+  expect(r.value).toMatchObject({ answer: 'hi', stopReason: 'end_turn' })
+})
+
+test('session.start: the hook beneath runs exactly once, even with the store and the state broken', async ($, on) => {
+  const clock = mock.clock(on)
+  let starts = 0
+  on('session.start', (_$: any, e: any) => {
+    starts++
+    return { cwd: e.cwd } as never
+  })
+  on('session.id', () => ({ value: 's1' }) as never)
+  on('store.get', () => {
+    throw new Error('store down')
+  })
+  on('store.set', () => {
+    throw new Error('store down')
+  })
+  on('state.set', () => {
+    throw new Error('state unavailable')
+  })
+  const r = await $.session.start({ cwd: '/here', surface: 'terminal', isInteractive: true } as never)
+  await clock.advance(0)
+  expect(starts).toBe(1)
+  expect(r).toMatchObject({ cwd: '/here' })
+})
+
+// ── The forecast warns again only after a reset, or once it's an hour away ──
+test('a forecast that drops out does not warn again; a reset does', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  // the 5h limit resets 50 minutes in: a slower pace drops the forecast (it would reset first)
+  // before it could ever be an hour away
+  const r = (pct: number) => five(pct, 50 * 60_000)
+  w.limits = [r(40)]
+  await prompt($, 'go')
+  await start($, 'm')
+  let pct = await climb(w, 40, 1, 180, r)
+  await w.clock.advance(10_000)
+  expect(paceToasts(w).length).toBe(1)
+  expect(paceToasts(w)[0]).toMatch(/^⚠ 5h limit: ~2\dm left at this pace/)
+  // over 10 minutes of work with no rise: the forecast goes (it's measured, just not rising now)
+  pct = await climb(w, pct, 0, 660, r)
+  await hidden(band($), /left/)
+  // a climb back under 30 minutes: the same warning isn't shown again
+  pct = await climb(w, pct, 2, 300, r)
+  await w.clock.advance(5_000)
+  await shows(band($), /^ · ~\d+m left$/)
+  expect(paceToasts(w).length).toBe(1)
+  // the window resets: measuring starts over, and the next climb warns again
+  const next = (p: number) => five(p, 5 * 3600_000)
+  w.limits = [next(1)]
+  await w.clock.advance(2_000)
+  await climb(w, 1, 2, 180, next)
+  await w.clock.advance(10_000)
+  expect(paceToasts(w).length).toBe(2)
+  expect(paceToasts(w)[1]).toMatch(/^⚠ 5h limit: ~\d+m left at this pace/)
+})
+
+// ── autoOpen off (the default): only /radar opens the panel ──────────────
+test('with autoOpen off, a helper never opens the panel; an open one only takes its new height', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  // fullscreen, as the band says
+  await shows(bandIn($, true), /Usage Radar/)
+  w.agents = [helper(1), helper(2), helper(3)]
+  await start($, 'h1', 'a1')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(0)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+  // /radar opens it; the next helper resizes the open panel, once
+  expect((await radarCmd($, 'open')).text).toMatch(/^Usage Radar opened/)
+  const opens = w.openArgs.length
+  await start($, 'h2', 'a2')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 1)
+  // closed again: the next helper leaves it closed
+  await radarCmd($, 'close')
+  await start($, 'h3', 'a3')
+  await w.clock.advance(0)
+  expect(w.openArgs.length).toBe(opens + 1)
+  expect(w.panes.has(PANE_ID)).toBe(false)
+})
+
+for (const [kind, options] of [['off', {}], ['on', { autoOpen: true }]] as const) {
+  test(`with autoOpen ${kind} and the layout unknown, a helper does not open the panel`, { options: options as never }, async ($, on) => {
+    const w = world(on)
+    await withHelpers($, w, 2)
+    expect(w.openArgs.length).toBe(0)
+    expect(w.panes.has(PANE_ID)).toBe(false)
+  })
+}
+
+// ── Another version's record ────────────────────────────────────────────
+test('a newer version\'s record of this session is never written over', async ($, on) => {
+  const newer = { v: 2, updatedAt: 1, name: 'theirs', cost: 9, tokens: 9, totals: { any: 'shape' } }
+  const w = world(on, { 'session:s1': newer })
+  await job($, w, 'go', 0.05, 2_000)
+  await w.clock.advance(20_000)
+  await job($, w, 'more', 0.07, 1_000)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 's1', resume: { id: 's1' } } as never)
+  expect(record(w)).toEqual(newer)
+  // this session counts from zero on screen
+  await shows(pane($), /^≈\$0\.07$/, /^3k$/)
+  await hidden(pane($), /theirs/)
+})
+
+// ── A wiped state (/clear, /resume): what carries over ──────────────────
+test('after /clear, private mode stays on before any prompt: no email, no name, the panel open', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, {}, 'you@work.example.com', true)
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await radarCmd($, 'private')
+  await radarCmd($, 'open')
+  await clearTo($, w, 's2')
+  // the new session's first word is the classic SessionStart, with its title
+  await $.classic.SessionStart({ session_title: 'Secret plan' } as never)
+  await hidden(pane($), /@/, /Secret plan/, /radar private/)
+  await shows(pane($), exactly('[WORK]'))
+  await prompt($, 'DEMO-7 another thing')
+  await start($, 'm')
+  await hidden(band($, 160), /@/, /Secret plan/, /DEMO-7/)
+  await hidden(pane($), /@/, /Secret plan/, /DEMO-7/)
+})
+
+for (const held of [false, true]) {
+  test(`after /clear the Spend row is back at once${held ? ', also while Anthropic asks to wait' : ''}`, async ($, on) => {
+    const w = world(on, {}, 0, {}, true)
+    if (held) await heldBack($, w, busyReply(429, '600'))
+    else {
+      spendOn(w, SPEND(1240, 10000))
+      await begin($, w)
+      await job($, w, 'go', 0.01)
+    }
+    const fetches = w.fetches.length
+    await w.clock.advance(5_000)
+    await clearTo($, w, 's2')
+    await $.classic.SessionStart({} as never)
+    await shows(pane($), /\$12\.40 of \$100 used/)
+    await prompt($, 'next')
+    await w.clock.advance(0)
+    await shows(pane($), /\$12\.40 of \$100 used/)
+    // no extra request: the minute (or the wait) still counts
+    expect(w.fetches.length).toBe(fetches)
+  })
+}
+
+test('after /clear a warning already shown is not shown again; /resume brings its totals back', async ($, on) => {
+  const w = world(on, {}, 0, {}, true)
+  w.limits = [five(84)]
+  await job($, w, 'go', 0.30, 40_000)
+  expect(w.toasts.filter(t => /5h limit 84% used/.test(t)).length).toBe(1)
+  await clearTo($, w, 's2')
+  w.cost = 0
+  await job($, w, 'fresh', 0.01)
+  expect(w.toasts.filter(t => /5h limit 84% used/.test(t)).length).toBe(1)
+  await shows(band($), /^5h limit $/, /84%/)
+  await clearTo($, w, 's1', 'resume')
+  w.cost = 0
+  await job($, w, 'back', 0.02)
+  await shows(pane($), /^≈\$0\.32$/, /^41k$/)
+  expect(w.toasts.filter(t => /5h limit 84% used/.test(t)).length).toBe(1)
+})
+
+test('after a logout no old dollars show until a new reading, and the account file is read again', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, {}, 'me@work.example.com', true)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$12\.40/, exactly('[WORK] me@work.example.com'))
+  const reads = w.reads
+  // /logout, then /login as someone else: the next check's answer is slow
+  await clearTo($, w, 's2', 'logout')
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(5000, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  const fetches = w.fetches.length
+  await prompt($, 'hello')
+  await w.clock.advance(0)
+  expect(w.reads).toBeGreaterThan(reads)
+  expect(w.fetches.length).toBe(fetches + 1)
+  await hidden(pane($), /^Spend/, /\$12\.40/, /work\.example/)
+  await shows(pane($), exactly('[PERSONAL] me@gmail.com'))
+  w.hold = null
+  land()
+  await w.clock.advance(0)
+  await shows(pane($), /\$50 of \$100 used/)
+})
+
+// ── /radar private from another terminal ───────────────────────────────
+test('/radar private from another terminal: taken at the next prompt, and within a minute while idle', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+  // another terminal turns it on: this one's next prompt hides them
+  w.store.set('private', true)
+  await prompt($, 'more')
+  await start($, 'm')
+  await hidden(band($, 160), /@/, /DEMO-142/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  await complete($, 'm')
+  // ... and off, then on again, while this one is idle with the panel open
+  w.store.set('private', false)
+  await w.clock.advance(60_000)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+  await radarCmd($, 'open')
+  const opened = w.opened.length
+  w.store.set('private', true)
+  await w.clock.advance(60_000)
+  await hidden(pane($), /@/, /DEMO-142/)
+  expect(w.opened.length).toBe(opened + 1)
+  await drawnAsOpened($, w)
+  w.store.set('private', false)
+  await w.clock.advance(60_000)
+  await shows(pane($), exactly('[WORK] you@work.example.com'), exactly('DEMO-142'))
+  expect(w.opened.length).toBe(opened + 2)
+  await drawnAsOpened($, w)
+})
+
+// ── The spend wait shared by the sessions of one config dir ────────────
+test('another session\'s wait holds the check back until it passes; the good read clears it', async ($, on) => {
+  const w = world(on, { 'spend-hold': { until: 5 * 60_000, backoffs: 1 } })
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  expect(w.fetches.length).toBe(0)
+  await w.clock.advance(4 * 60_000)
+  await prompt($, 'go')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(0)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(1)
+  await shows(pane($), /\$12\.40 of \$100 used/)
+  expect(w.store.has('spend-hold')).toBe(false)
+})
+
+for (const [label, hold] of [
+  ['not an object', 'junk'],
+  ['a time that is not a number', { until: 'soon', backoffs: 1 }],
+  ['an odd count', { until: 5 * 60_000, backoffs: 1.5 }],
+  ['a count past 20', { until: 5 * 60_000, backoffs: 99 }],
+  ['a wait far past 15 minutes', { until: 24 * 3600_000, backoffs: 1 }],
+] as const) {
+  test(`a shared wait that makes no sense is left out (${label}): the check goes right away`, async ($, on) => {
+    const w = world(on, { 'spend-hold': hold })
+    spendOn(w, SPEND(1240, 10000))
+    await begin($, w)
+    expect(w.fetches.length).toBe(1)
+    await shows(pane($), /\$12\.40 of \$100 used/)
+  })
+}
+
+test('a shared wait that is over still counts: the next busy answer waits 15 minutes', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on, { 'spend-hold': { until: 0, backoffs: 3 } })
+  spendOn(w, SPEND(1240, 10000))
+  w.reply = busyReply(429)
+  await begin($, w)
+  expect(w.fetches.length).toBe(1)
+  expect(w.store.get('spend-hold')).toMatchObject({ backoffs: 4 })
+  const gap = await nextGap(w, 20 * 60_000)
+  expect(gap).toBeGreaterThanOrEqual(15 * 60_000)
+  expect(gap).toBeLessThanOrEqual(15 * 60_000 * 1.1 + 60_000)
+})
+
+test('a busy answer shares its wait; a good answer after it clears the store', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  await heldBack($, w, busyReply(429, '300'))
+  const hold = w.store.get('spend-hold') as { until: number; backoffs: number }
+  expect(hold.backoffs).toBe(1)
+  expect(hold.until).toBeGreaterThanOrEqual(60_000 + 300_000)
+  expect(hold.until).toBeLessThanOrEqual(60_000 + 330_000)
+  spendOn(w, SPEND(1300, 10000))
+  await nextGap(w, 400_000)
+  await shows(pane($), /\$13 of \$100 used/)
+  expect(w.store.has('spend-hold')).toBe(false)
+})
+
+test('a broken store backs off on its own, as before', { timeoutMs: 30_000 }, async ($, on) => {
+  const w = world(on)
+  w.storeBroken = true
+  await heldBack($, w, busyReply(429))
+  for (const least of [120_000, 240_000]) {
+    const gap = await nextGap(w, 20 * 60_000)
+    expect(gap).toBeGreaterThanOrEqual(least)
+    expect(gap).toBeLessThanOrEqual(least * 1.1 + 60_000)
+  }
+  await shows(pane($), /\$12\.40/)
+})
+
+// ── A helper's own to-do list, and calls side by side ──────────────────
+test('a helper\'s TodoWrite leaves the main to-do list; its TaskUpdate still counts', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  await $.tool.call({ tool: 'TodoWrite', todos: [
+    { id: '1', content: 'A', status: 'completed', activeForm: 'Doing A' },
+    { id: '2', content: 'B', status: 'in_progress', activeForm: 'Writing tests' },
+  ] } as never)
+  await shows(band($), /1\/2 tasks/)
+  await start($, 'h1', 'a1')
+  await $.tool.call({ tool: 'TodoWrite', agentId: 'a1', todos: [{ content: 'X', status: 'pending' }] } as never)
+  await shows(band($), /1\/2 tasks/)
+  await hidden(band($), /0\/1 tasks/)
+  await $.tool.call({ tool: 'TaskUpdate', agentId: 'a1', taskId: '2', status: 'completed' } as never)
+  await shows(band($), /2\/2 tasks/)
+})
+
+test('two calls side by side: the first to finish leaves the other one showing', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await step($, w, 'm', 1_000, 0)
+  let endFirst = () => {}
+  let endSecond = () => {}
+  w.toolHold = new Promise(r => { endFirst = r })
+  const first = $.tool.call({ tool: 'Bash', command: 'sleep 5' } as never)
+  await w.clock.advance(0)
+  w.toolHold = new Promise(r => { endSecond = r })
+  const second = $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
+  await w.clock.advance(0)
+  w.toolHold = null
+  await shows(band($), exactly('Bash: npm test'))
+  endFirst()
+  await first
+  await shows(band($), exactly('Bash: npm test'))
+  endSecond()
+  await second
+  await shows(band($), exactly('Thinking…'))
+  await complete($, 'm')
+  await shows(band($), exactly('Done'))
+})
+
+// ── Private mode: a choice the store didn't take, and a read it overtook ──
+test('a /radar private the store could not save stays on at the next prompt and minute', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: false })
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  await shows(pane($), exactly('[WORK] you@work.example.com'))
+  w.writeBroken = true
+  expect((await radarCmd($, 'private')).text).toBe('Private mode on: email and session name hidden.')
+  w.writeBroken = false
+  expect(w.store.get('private')).toBe(false)
+  await prompt($, 'more')
+  await start($, 'm')
+  await hidden(band($, 160), /@/, /DEMO-142/)
+  await hidden(pane($), /@/, /DEMO-142/)
+  await complete($, 'm')
+  await w.clock.advance(60_000)
+  await hidden(pane($), /@/, /DEMO-142/)
+  // saved at last: from then on the store has it again
+  expect((await radarCmd($, 'private off')).text).toBe('Private mode off: email and session name shown.')
+  expect(w.store.get('private')).toBe(false)
+  await w.clock.advance(60_000)
+  await shows(pane($), exactly('[WORK] you@work.example.com'))
+})
+
+test('a store read of private mode on its way when /radar private lands is dropped', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: false })
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  // the minute's read of `private` reads false, then lands only after the command
+  let land = () => {}
+  w.privateReadHold = new Promise(r => { land = r })
+  await w.clock.advance(60_000)
+  expect(w.privateReadHold).toBeNull()
+  await radarCmd($, 'private')
+  land()
+  await w.clock.advance(0)
+  await hidden(pane($), /@/, /DEMO-142/)
+  expect(w.store.get('private')).toBe(true)
+})
+
+test('the classic SessionStart first, private mode stored on: no email is ever drawn', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: true })
+  await $.classic.SessionStart({ session_title: 'Secret plan' } as never)
+  await hidden(pane($), /@/, /Secret plan/)
+  await shows(pane($), exactly('[WORK]'))
+})
+
+// ── Right after /clear, idle: the minute timer runs again without a prompt ──
+for (const [label, options, first] of [
+  ['/radar open is all that comes', LABELS, 'radar'],
+  ['only the classic SessionStart comes, showSpend off', { ...LABELS, showSpend: false }, 'classic'],
+] as const) {
+  test(`after /clear, idle, private mode from another terminal is taken within a minute (${label})`, { options: options as never }, async ($, on) => {
+    const w = workWorld(on, { private: false }, 'you@work.example.com', true)
+    spendOn(w, SPEND(1240, 10000))
+    await begin($, w)
+    await job($, w, 'DEMO-142 fix the login', 0.01)
+    await clearTo($, w, 's2')
+    if (first === 'classic') await $.classic.SessionStart({} as never)
+    else await radarCmd($, 'open')
+    await shows(pane($), exactly('[WORK] you@work.example.com'))
+    // another terminal turns it on; this one sits idle
+    w.store.set('private', true)
+    await w.clock.advance(60_000)
+    await hidden(pane($), /@/)
+    await shows(pane($), exactly('[WORK]'))
+    if (first === 'classic') expect(w.fetches.length).toBe(0) // showSpend off: no request at all
+  })
+}
+
+test('a /radar private off the store could not save gives way to another terminal turning it on', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on, { private: false })
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'DEMO-142 fix the login', 0.01)
+  w.writeBroken = true
+  await radarCmd($, 'private off')
+  w.writeBroken = false
+  await shows(pane($), exactly('[WORK] you@work.example.com'))
+  // another terminal turns it on: the next prompt here hides the email
+  w.store.set('private', true)
+  await prompt($, 'more')
+  await hidden(pane($), /@/, /DEMO-142/)
+  await start($, 'm')
+  await complete($, 'm')
+  await w.clock.advance(60_000)
+  await hidden(pane($), /@/, /DEMO-142/)
+})
+
+test('a spend check on its way at a logout is dropped: the old account\'s dollars never show', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$12\.40/)
+  // the minute's check (still the old login) is slow; its answer would be $30
+  spendOn(w, SPEND(3000, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  await w.clock.advance(60_000)
+  w.hold = null
+  const fetches = w.fetches.length
+  await $.session.end({ reason: 'logout', sessionId: 's1', resume: { id: 's1' } } as never)
+  land()
+  await w.clock.advance(0)
+  await hidden(pane($), /\$30 of/)
+  expect(w.fetches.length).toBe(fetches)
 })
