@@ -173,6 +173,14 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     writeBroken: false,
     /** what the next read of `private` waits for (it has read the value already: it lands late) */
     privateReadHold: null as null | Promise<void>,
+    /** every status line pushed; store reads that never answer (by key); how often the keys were listed */
+    statuses: [] as string[],
+    stuckGet: null as null | ((key: string) => boolean),
+    keysListed: 0,
+    /** a hook beneath drops every prompt with this reason (null: none) */
+    dropPrompt: null as null | string,
+    /** what the next fs.read waits for (it has read the file already: it lands late) */
+    fileHold: null as null | Promise<void>,
   }
   on('session.authorize', () => {
     w.authorized++
@@ -190,14 +198,20 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     return { value: { ...reply, headers: reply.headers ?? {} } } as never
   })
   mock.env(on, env)
-  on('fs.read', (_$: any, e: any) => {
+  on('fs.read', async (_$: any, e: any) => {
     w.reads++
     const text = w.files[e.path]
+    const hold = w.fileHold
+    if (hold) {
+      w.fileHold = null
+      await hold
+    }
     return (text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }) as never
   })
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }) as never)
   on('store.get', async (_$: any, e: any) => {
     if (w.storeBroken) throw new Error('store down')
+    if (w.stuckGet?.(e.key)) await new Promise(() => {})
     const value = w.store.get(e.key)
     const hold = e.key === 'private' ? w.privateReadHold : null
     if (hold) {
@@ -215,7 +229,10 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     w.store.delete(e.key)
     return { value: undefined } as never
   })
-  on('store.keys', () => ({ value: [...w.store.keys()] }) as never)
+  on('store.keys', () => {
+    w.keysListed++
+    return { value: [...w.store.keys()] } as never
+  })
   on('session.id', () => ({ value: w.sid }) as never)
   on('session.usage', async () => {
     if (w.usageBroken) throw new Error('no usage')
@@ -251,7 +268,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
     w.closes.push(e.origin?.kind)
     return { value: undefined } as never
   })
-  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.status', (_$: any, e: any) => { w.statuses.push(e.text ?? ''); return { value: undefined } as never })
   on('ui.toast', (_$: any, e: any) => { w.toasts.push(e.text); return { value: undefined } as never })
   on('command.register', () => {
     w.registers++
@@ -266,7 +283,7 @@ const world = (on: any, seed: Record<string, unknown> = {}, now = 0, env: Record
   on('session.end', (_$: any, e: any) => ({ sessionId: e.sessionId }) as never)
   on('classic.SessionStart', () => ({}) as never)
   on('classic.UserPromptSubmit', () => ({}) as never)
-  on('prompt.submit', (_$: any, e: any) => ({ text: e.text }) as never)
+  on('prompt.submit', (_$: any, e: any) => (w.dropPrompt !== null ? { drop: w.dropPrompt } : { text: e.text }) as never)
   on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
   on('tool.call', async () => {
@@ -510,6 +527,7 @@ test('sessions unused for 90 days are pruned, other keys and versions kept', asy
   }, now)
   w.sid = 'new'
   await job($, w, 'hello', 0.01)
+  await w.clock.settle() // pruning runs in the background
   expect([...w.store.keys()].sort()).toEqual(['other', 'session:new', 'session:recent1', 'session:recent2', 'session:v2'])
   expect(w.store.get('session:v2')).toEqual({ v: 2, x: 1 })
   expect(w.store.get('other')).toBe('keep me')
@@ -576,12 +594,12 @@ const NAMES: Array<[string, string, string]> = [
   ['USAGE-RADAR: Agent names', 'USAGE-RADAR', 'ticket'],
   ['please refactor the payment service retry logic', 'please refactor the payment service', 'words'],
   ['fix UTF-8 handling and TODO in src/ABC-1.ts', 'fix UTF-8 handling and TODO', 'words'],
-  ['fix qzx-142 redirect', 'QZX-142', 'ticket'],
+  ['fix qzx-142 redirect', 'fix qzx-142 redirect', 'words'],
   ['usage-radar tweaks', 'usage-radar tweaks', 'words'],
   ['bump gpt-4 and utf-8 support now', 'bump gpt-4 and utf-8 support', 'words'],
   ['look at https://acme.atlassian.net/browse/DEMO-142 please', 'DEMO-142', 'ticket'],
   ['see https://jira.example.com/jira/browse/ops-77?focusedCommentId=1', 'OPS-77', 'ticket'],
-  ['fix qzx-42 redirect', 'QZX-42', 'ticket'],
+  ['fix qzx-42 redirect', 'fix qzx-42 redirect', 'words'],
   ['do step-2 of the python-3 upgrade', 'do step-2 of the python-3', 'words'],
   ['show top-10 web-01 hosts in prod', 'show top-10 web-01 hosts in', 'words'],
   ['fix WEB-01 and CI-CD in prod', 'fix WEB-01 and CI-CD in', 'words'],
@@ -592,6 +610,23 @@ const NAMES: Array<[string, string, string]> = [
   ['NON-NULL fields', 'NON-NULL fields', 'words'],
   ['API-123 fix', 'API-123', 'ticket'],
   ['see https://x.atlassian.net/browse/API-12', 'API-12', 'ticket'],
+  // 2.4.4: lower case outside a Jira link, and plain words like JSON-RPC, are no tickets
+  ['upgrade node-18 and fix test-1', 'upgrade node-18 and fix test-1', 'words'],
+  ['see line-42', 'see line-42', 'words'],
+  ['Implement JSON-RPC', 'Implement JSON-RPC', 'words'],
+  ['AWS-SDK upgrade', 'AWS-SDK upgrade', 'words'],
+  ['sonnet-4 vs claude-4', 'sonnet-4 vs claude-4', 'words'],
+  ['see https://acme.atlassian.net/browse/proj-12 now', 'PROJ-12', 'ticket'],
+  // in capitals a key is a ticket, also one that reads like a word
+  ['fix WEB-123 login', 'WEB-123', 'ticket'],
+  ['see STEP-2 in the doc', 'STEP-2', 'ticket'],
+  // a link, and words before a colon, are no secrets
+  ['see https://github.com/Tejas274/claude-mods/pull/12', 'see https://github.com/Tejas274/claude-mods/pull/12', 'words'],
+  ['fix the keyboard: shortcut for search', 'fix the keyboard: shortcut for', 'words'],
+  ['Change the token: limit in config', 'Change the token: limit in', 'words'],
+  // a bearer token and a link's user and password go; the host stays
+  ['use Bearer abcdefghijklmnop1234 for auth', 'use for auth', 'words'],
+  ['clone https://bob:hunter2@git.example.com/repo now', 'clone https://git.example.com/repo now', 'words'],
 ]
 
 test('the first prompt names the session', { options: { showName: true } }, async ($, on) => {
@@ -1244,7 +1279,7 @@ for (const wiped of MODES) {
 
 test('/radar budget: show, bad amounts, lowering below the spend, off, $2', async ($, on) => {
   const w = world(on)
-  expect((await radarCmd($, 'budget abc')).text).toBe('Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50), or off.')
+  expect((await radarCmd($, 'budget abc')).text).toBe('Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50, at least $0.01), or off.')
   expect((await radarCmd($, 'budget -3')).text).toMatch(/takes an amount/)
   expect((await radarCmd($, 'budget')).text).toBe('No budget for this session. Set one with /radar budget 5')
   await job($, w, 'go', 0.50)
@@ -1524,6 +1559,13 @@ const begin = async ($: Engine, w: World) => {
 const measure = ($: Engine, limits: Array<Record<string, unknown>>) =>
   $.session.measure({ context: { window: 200_000, percent: 10 }, rateLimits: limits, changed: ['rateLimits'] } as never)
 const seven = (pct: number) => ({ kind: 'seven_day', percentUsed: pct })
+// A minute on, then an event (a measure of the limits) that checks the spend limit at once, as in a
+// working session. (Idle, the minute timer checks only every 5 minutes.)
+const minute = async ($: Engine, w: World) => {
+  await w.clock.advance(60_000)
+  await measure($, w.limits)
+  await w.clock.advance(0)
+}
 // The band's meter labels, in order
 const labels = async ($: Engine) => {
   const ui = await band($)
@@ -1569,7 +1611,7 @@ test('the dollars and Claude Code\'s own spend_limit are one Spend row, with its
   await shows(pane($), /\$12\.40 of \$100 used/, /^12%$/, /resets in 8d 14h/)
   // 96%: from the next check, and Claude Code's own reading after it: one ⛔
   spendOn(w, SPEND(9600, 10000))
-  await w.clock.advance(60_000)
+  await minute($, w)
   await measure($, [{ kind: 'spend_limit', percentUsed: 96, resetsAt }])
   expect(w.toasts.filter(t => /^⛔ Spend 96% used/.test(t)).length).toBe(1)
   expect(w.toasts.filter(t => /^⛔ Spend/.test(t)).length).toBe(1)
@@ -1647,19 +1689,19 @@ test('a refused check (401) keeps the last reading; the third in a row drops it'
   await shows(pane($), /\$12\.40/)
   const toasts = w.toasts.length
   w.reply = { status: 401, ok: false, text: '' }
-  await w.clock.advance(60_000)
+  await minute($, w)
   await shows(pane($), /\$12\.40/)
-  await w.clock.advance(60_000)
+  await minute($, w)
   await shows(pane($), /\$12\.40/)
   // a good answer in between starts the count over
   spendOn(w, SPEND(1240, 10000))
-  await w.clock.advance(60_000)
+  await minute($, w)
   w.reply = { status: 401, ok: false, text: '' }
-  await w.clock.advance(60_000)
-  await w.clock.advance(60_000)
+  await minute($, w)
+  await minute($, w)
   await shows(pane($), /\$12\.40/)
   // the third failure in a row
-  await w.clock.advance(60_000)
+  await minute($, w)
   await hidden(pane($), /^Spend/, /\$12\.40/)
   expect(w.toasts.length).toBe(toasts)
 })
@@ -1671,11 +1713,11 @@ test('an answer without a spend limit drops the last reading at once', async ($,
   await job($, w, 'go', 0.01)
   await shows(pane($), /\$12\.40/)
   spendOn(w, { spend: null, extra_usage: null })
-  await w.clock.advance(60_000)
+  await minute($, w)
   await hidden(pane($), /^Spend/, /\$12\.40/)
 })
 
-test('the spend limit is read once a minute, also while idle', async ($, on) => {
+test('the spend limit is read every 5 minutes while idle, once a minute while working', async ($, on) => {
   const w = world(on)
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
@@ -1684,18 +1726,31 @@ test('the spend limit is read once a minute, also while idle', async ($, on) => 
   await start($, 'm')
   for (let i = 0; i < 3; i++) await measure($, [])
   await complete($, 'm')
-  await w.clock.advance(59_000)
+  // idle: not at the next minute, nor the ones after, until 5 minutes have gone
+  await w.clock.advance(60_000)
   expect(w.fetches.length).toBe(1)
-  await w.clock.advance(1_000)
-  expect(w.fetches.length).toBe(2)
   await w.clock.advance(180_000)
-  expect(w.fetches.length).toBe(5)
+  expect(w.fetches.length).toBe(1)
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(2)
+  await w.clock.advance(300_000)
+  expect(w.fetches.length).toBe(3)
+  // working: once a minute
+  await prompt($, 'more')
+  await start($, 'm')
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(4)
+  await w.clock.advance(120_000)
+  expect(w.fetches.length).toBe(6)
 })
 
 test('an event check off the minute grid moves the next one: never two within a minute', async ($, on) => {
   const w = world(on)
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
+  // while working, the minute timer checks every minute
+  await prompt($, 'go')
+  await start($, 'm')
   await w.clock.advance(60_000)
   expect(w.fetches.length).toBe(2)
   // a second after the tick: too soon
@@ -1737,6 +1792,9 @@ test('a tick a few seconds early after an off-grid check still checks every minu
   spendOn(w, SPEND(1240, 10000))
   w.surfaces = []
   await begin($, w)
+  // while working, the minute timer checks every minute
+  await prompt($, 'go')
+  await start($, 'm')
   // the first check happens 3 s in, so each tick lands 3 s "early" against it
   w.surfaces = ['terminal']
   await w.clock.advance(3_000)
@@ -1851,7 +1909,7 @@ test('an open panel shrinks when the Spend row goes', async ($, on) => {
   await radar($)
   const opened = w.opened.length
   spendOn(w, { spend: null, extra_usage: null })
-  await w.clock.advance(60_000)
+  await minute($, w)
   expect(w.opened.length).toBe(opened + 1)
   const ui: any = await pane($)
   expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
@@ -2025,7 +2083,7 @@ test('an open panel grows when the Spend row first appears', async ($, on) => {
   await radar($)
   const opened = w.opened.length
   spendOn(w, SPEND(1240, 10000))
-  await w.clock.advance(60_000)
+  await minute($, w)
   expect(w.opened.length).toBe(opened + 1)
   const ui: any = await pane($)
   expect(w.opened.at(-1)).toBe(height(await ui.drawn()))
@@ -2064,7 +2122,7 @@ for (const [label, auth] of [['no claude login', null], ['an API key', { handle:
     await shows(pane($), /\$12\.40/)
     const toasts = w.toasts.length
     w.auth = auth
-    await w.clock.advance(60_000)
+    await minute($, w)
     await hidden(pane($), /^Spend/, /\$12\.40/)
     expect(w.toasts.length).toBe(toasts)
   })
@@ -2101,7 +2159,7 @@ test('an answer on its way when the account changes is dropped', async ($, on) =
   spendOn(w, SPEND(3000, 10000))
   let land = () => {}
   w.hold = new Promise(r => { land = r })
-  await w.clock.advance(60_000)
+  await minute($, w)
   w.hold = null
   // meanwhile, /login as someone else
   w.files['/Users/t/.claude.json'] = account('me@gmail.com')
@@ -2121,10 +2179,10 @@ test('asking for the login failing keeps the last reading like any failed check'
   await job($, w, 'go', 0.01)
   const toasts = w.toasts.length
   w.auth = 'throw'
-  await w.clock.advance(60_000)
-  await w.clock.advance(60_000)
+  await minute($, w)
+  await minute($, w)
   await shows(pane($), /\$12\.40/)
-  await w.clock.advance(60_000)
+  await minute($, w)
   await hidden(pane($), /^Spend/)
   expect(w.toasts.length).toBe(toasts)
 })
@@ -2135,8 +2193,21 @@ test('asking for the login failing keeps the last reading like any failed check'
 // The text a drawn element shows, and how many columns it takes (a row: its children + gaps)
 const textOf = (el: any): string =>
   typeof el === 'string' || typeof el === 'number' ? String(el) : (el?.children ?? []).map(textOf).join('')
+// terminal columns, counted here on their own: marks and control characters 0; emoji, ⛔ and
+// East Asian wide letters 2 (a sign followed by U+FE0F too); the rest 1
+const displayWidth = (text: string): number => {
+  const chars = Array.from(text)
+  return chars.reduce((n, c, i) => {
+    if (/^[0-9#*]$/.test(c) && chars[i + 1] === '\uFE0F' && chars[i + 2] === '\u20E3') return n + 2
+    if (/[\p{Mn}\p{Me}\p{Cf}\p{Cc}]/u.test(c)) return n
+    if (c === '⛔' || /\p{Emoji_Presentation}/u.test(c)) return n + 2
+    if (/[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60\uFFE0-\uFFE6]/u.test(c)) return n + 2
+    if (/\p{Extended_Pictographic}/u.test(c) && chars[i + 1] === '\uFE0F') return n + 2
+    return n + 1
+  }, 0)
+}
 const columns = (el: any): number => {
-  if (el.type === 'Text') return textOf(el).length
+  if (el.type === 'Text') return displayWidth(textOf(el))
   const kids = (el.children ?? []).filter((c: any) => c && typeof c === 'object')
   return el.props?.flexDirection === 'row'
     ? kids.reduce((s: number, c: any) => s + columns(c), 0) + (el.props?.gap ?? 0) * Math.max(0, kids.length - 1)
@@ -2303,7 +2374,7 @@ test('an open panel grows when the dollars arrive for Claude Code\'s own Spend r
   const opened = w.opened.length
   const rows = w.opened.at(-1) ?? 0
   spendOn(w, SPEND(1240, 10000))
-  await w.clock.advance(60_000)
+  await minute($, w)
   expect(w.opened.length).toBe(opened + 1)
   expect(w.opened.at(-1)).toBe(rows + 1)
   const ui: any = await pane($)
@@ -2419,7 +2490,7 @@ test('with showName, /rename on an unnamed session grows an open panel once; a s
 const headerAt = async ($: Engine, cols: number, fitting = true) => {
   const [header] = await bandLines($, cols)
   const text = textOf(header)
-  if (fitting) expect(columns(header), `${cols} columns: ${text}`).toBeLessThanOrEqual(Math.max(30, cols - 4))
+  if (fitting) expect(columns(header), `${cols} columns: ${text}`).toBeLessThanOrEqual(Math.max(1, cols - 4))
   return text
 }
 
@@ -2441,8 +2512,8 @@ for (const budget of [false, true]) {
     expect(await headerAt($, noClock + 4)).toBe(`◉ Usage Radar✳ Opus 5.5# 31k${cost}`)
     // then the model; the badge gets the room that frees
     expect(await headerAt($, noClock + 3)).toBe(`◉ Usage Radar# 31k${cost}[WORK]`)
-    // very narrow: the cost still shows (with a budget, the title and the cost alone are wider than the band)
-    expect(await headerAt($, 20, !budget)).toBe(`◉ Usage Radar# 31k${cost}`)
+    // very narrow: the title gets short, the tokens go, a budget shows as the cost alone; it still fits
+    expect(await headerAt($, 20)).toBe('◉ Radar≈$0.03')
   })
 }
 
@@ -2592,7 +2663,7 @@ for (const wiped of MODES) {
   })
 }
 
-test('the store only keeps sessions and the private boolean, never the email', { options: LABELS }, async ($, on) => {
+test('the store only keeps sessions, the private boolean and the warning levels, never the email', { options: LABELS }, async ($, on) => {
   const w = workWorld(on)
   await begin($, w)
   await job($, w, 'DEMO-142 fix the login', 0.01)
@@ -2601,7 +2672,7 @@ test('the store only keeps sessions and the private boolean, never the email', {
   const all = JSON.stringify([...w.store.entries()])
   expect(all).not.toContain('work.example.com')
   expect(all).not.toContain('@')
-  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private')).toBe(true)
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private' || key === 'alerts')).toBe(true)
   expect(w.store.get('private')).toBe(false)
 })
 
@@ -2953,11 +3024,18 @@ const nextGap = async (w: World, maxMs: number): Promise<number> => {
   expect(w.fetches.length, `a request within ${maxMs} ms`).toBe(n + 1)
   return (w.fetchedAt.at(-1) ?? 0) - (w.fetchedAt.at(-2) ?? 0)
 }
-// A reading of $12.40, then Anthropic answering `reply` from the next minute's check on
+// A job that keeps working (the minute timer checks the spend limit every minute meanwhile)
+const working = async ($: Engine, w: World) => {
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.01
+  await step($, w, 'm', 1000, 0)
+}
+// A reading of $12.40, then Anthropic answering `reply` from the next minute's check on (working)
 const heldBack = async ($: Engine, w: World, reply: ReturnType<typeof busyReply>) => {
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
-  await job($, w, 'go', 0.01)
+  await working($, w)
   await shows(pane($), /\$12\.40/)
   w.reply = reply
   await w.clock.advance(60_000)
@@ -2968,7 +3046,7 @@ test('a 429 waits as Retry-After asks, keeps the reading, and never resizes the 
   const w = world(on)
   spendOn(w, SPEND(1240, 10000))
   await begin($, w)
-  await job($, w, 'go', 0.01)
+  await working($, w)
   await radarCmd($, 'open')
   const opened = w.opened.length
   w.reply = busyReply(429, '300')
@@ -3076,7 +3154,7 @@ test('backing off keeps no dollars in the store, only when to ask again', { opti
   w.files['/Users/t/.claude.json'] = account('me@work.example.com', 'Work Co')
   await heldBack($, w, busyReply(429, '300'))
   await w.clock.advance(10 * 60_000)
-  expect([...w.store.keys()].every(key => key.startsWith('session:') || key === 'private' || key === 'spend-hold')).toBe(true)
+  expect([...w.store.keys()].every(key => key.startsWith('session:') || ['private', 'spend-hold', 'alerts'].includes(key))).toBe(true)
   const hold = w.store.get('spend-hold') as Record<string, unknown>
   expect(Object.keys(hold).sort()).toEqual(['backoffs', 'until'])
   expect(typeof hold.until).toBe('number')
@@ -3535,6 +3613,7 @@ test('a shared wait that is over still counts: the next busy answer waits 15 min
   await begin($, w)
   expect(w.fetches.length).toBe(1)
   expect(w.store.get('spend-hold')).toMatchObject({ backoffs: 4 })
+  await working($, w)
   const gap = await nextGap(w, 20 * 60_000)
   expect(gap).toBeGreaterThanOrEqual(15 * 60_000)
   expect(gap).toBeLessThanOrEqual(15 * 60_000 * 1.1 + 60_000)
@@ -3719,4 +3798,708 @@ test('a spend check on its way at a logout is dropped: the old account\'s dollar
   await w.clock.advance(0)
   await hidden(pane($), /\$30 of/)
   expect(w.fetches.length).toBe(fetches)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2.4.4: a band that never wraps, a command's own job, one-line text, a bounded store, the
+// spend check every 5 minutes while idle, and warnings shared between terminals
+// ════════════════════════════════════════════════════════════════════════════
+// every Text the band (or the panel) draws
+const allTexts = async (mount: Promise<Ui>): Promise<string[]> => {
+  const ui = await mount
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  await ui.unmount()
+  return texts
+}
+// "2:05:03" or "0:40" → seconds
+const seconds = (clockText: string): number => clockText.split(':').reduce((s, x) => s * 60 + Number(x), 0)
+
+test('a tool call that comes once the job is done never shows: the band and the status line say Done', async ($, on) => {
+  const w = world(on)
+  const log = w.statuses
+  await prompt($, 'go')
+  await start($, 'm')
+  // a call while working shows; main finishes while it still runs
+  let release = () => {}
+  w.toolHold = new Promise(r => { release = r })
+  const first = $.tool.call({ tool: 'Bash', command: 'sleep 1' } as never)
+  await w.clock.advance(0)
+  await shows(band($), exactly('Bash: sleep 1'))
+  await complete($, 'm')
+  expect(log.at(-1)).toMatch(/^✓ .* · Done · /)
+  await shows(band($), exactly('Done'))
+  // a call that comes after the job is done (a wake-up the turn left behind)
+  const late = $.tool.call({ tool: 'Bash', command: 'sleep 2' } as never)
+  await w.clock.advance(0)
+  expect(log.at(-1)).toMatch(/^✓ .* · Done · /)
+  await shows(band($), exactly('Done'))
+  await hidden(band($), /Bash/)
+  release()
+  await first
+  await late
+  expect(log.at(-1)).toMatch(/^✓ .* · Done · /)
+  await hidden(band($), /Bash/)
+  for (const line of log.slice(-3)) expect(line).not.toMatch(/Bash/)
+})
+
+for (const cols of [15, 16, 20, 25, 35, 45, 60, 100]) {
+  test(`the band is three lines that fit ${cols} columns: a budget, the badge, a wide name, ⛔ and Spend 84%`, { options: { ...LABELS, showEmail: false } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+    await busy($, w, SPEND(8400, 10000))
+    await rename($, '修复登录页面的重定向问题')
+    await radarCmd($, 'budget 7')
+    w.limits = [five(96), seven(11)]
+    await measure($, w.limits)
+    const lines = await bandLines($, cols)
+    expect(lines.length).toBe(3)
+    for (const line of lines) expect(columns(line), `${cols} columns: ${textOf(line)}`).toBeLessThanOrEqual(Math.max(1, cols - 4))
+  })
+}
+
+test('the band counts ⛔ and wide letters as two columns', { options: { ...LABELS, showEmail: false } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  await busy($, w, SPEND(8400, 10000))
+  await rename($, '修复登录页面的重定向问题')
+  w.limits = [five(96), seven(96)]
+  await measure($, w.limits)
+  // a ⛔ meter takes one column more on screen than its .length; the CJK name twice its .length
+  for (const cols of [60, 64, 100]) {
+    const lines = await bandLines($, cols)
+    for (const line of lines) expect(columns(line), `${cols} columns: ${textOf(line)}`).toBeLessThanOrEqual(cols - 4)
+  }
+  expect(displayWidth('⛔ 修复')).toBe(7)
+})
+
+test('/radar budget: at least a cent; 2,50, .5 and 1,000 read as amounts', async ($, on) => {
+  world(on)
+  for (const bad of ['0.001', '0.009', '0', '0.00']) {
+    const text = (await radarCmd($, `budget ${bad}`)).text
+    if (bad === '0') expect(text).toBe('Budget off for this session.')
+    else expect(text).toBe('Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50, at least $0.01), or off.')
+  }
+  for (const [arg, set] of [['0.01', '$0.01'], ['2,50', '$2.50'], ['.5', '$0.50'], ['1,000', '$1000.00'], ['$1,234.50', '$1234.50'], ['$7', '$7.00']] as const) {
+    expect((await radarCmd($, `budget ${arg}`)).text, arg).toContain(`Budget set: ${set} for this session`)
+  }
+})
+
+test('a default budget under a cent counts as none', { options: { defaultBudget: 0.001 } }, async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  expect((await radarCmd($, 'budget')).text).toBe('No budget for this session. Set one with /radar budget 5')
+})
+
+// A plain job with two helpers, at the ledger's $0.20
+const twoHelpers = async ($: Engine, w: World) => {
+  w.agents = [helper(1), helper(2), helper(3)]
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.20
+  await step($, w, 'm', 1_000, 0)
+  for (const n of [1, 2]) {
+    await start($, `h${n}`, `a${n}`)
+    await step($, w, `h${n}`, 1_000, 0, `a${n}`)
+    await complete($, `h${n}`, `a${n}`)
+  }
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toContain(' · 3 agents · ')
+}
+
+test('a slash command that asks the model is its own job: its toast, its helpers, its last request', async ($, on) => {
+  const w = world(on)
+  await twoHelpers($, w)
+  // /feature: the command, then main's turn, one tool, one helper; the ledger goes up $0.10
+  await prompt($, '/feature x', { name: 'feature', args: 'x' })
+  await start($, 'm2')
+  await tool($)
+  await start($, 'h3', 'a3')
+  await step($, w, 'h3', 1_000, 0, 'a3')
+  await complete($, 'h3', 'a3')
+  w.cost = 0.30
+  await step($, w, 'm2', 2_000, 0)
+  await complete($, 'm2')
+  expect(w.toasts.at(-1)).toMatch(/ · 2 agents · 1 step · ≈\$0\.10$/)
+  await shows(band($), /1 helper done/)
+  await shows(pane($), /^last request ≈\$0\.10 · 3k tokens · /)
+  // built-ins that never reach the model start no job
+  const toasts = w.toasts.length
+  for (const name of ['radar', 'config', 'clear']) await prompt($, `/${name}`, { name, args: '' })
+  await w.clock.advance(5_000)
+  expect(w.toasts.length).toBe(toasts)
+  await shows(pane($), /^last request ≈\$0\.10 · 3k tokens · /, exactly('Done'))
+})
+
+test('helpers of many command jobs fold into the "+N earlier" line, like typed prompts', async ($, on) => {
+  const w = world(on)
+  for (let i = 1; i <= 12; i++) {
+    w.agents = [helper(i)]
+    await prompt($, `/feature x${i}`, { name: 'feature', args: `x${i}` })
+    await start($, `m${i}`)
+    await start($, `h${i}`, `a${i}`)
+    await step($, w, `h${i}`, 1_000, 0, `a${i}`)
+    await complete($, `h${i}`, `a${i}`)
+    await complete($, `m${i}`)
+  }
+  // between jobs 8 rows are kept; this job's helper comes on top of them
+  expect(record(w)?.agents.length).toBeLessThanOrEqual(9)
+  expect(record(w)?.earlier.agents).toBeGreaterThanOrEqual(3)
+  await shows(pane($), /^\+\d+ earlier agents/)
+})
+
+test('a command with new lines in it stays on one line, in the band and the status line', async ($, on) => {
+  const w = world(on)
+  const log = w.statuses
+  await prompt($, 'go')
+  await start($, 'm')
+  let release = () => {}
+  w.toolHold = new Promise(r => { release = r })
+  const call = $.tool.call({ tool: 'Bash', command: 'git commit -F - <<EOF\nfix: the thing\r\n\nmore\tdetail\x1b[31m!\x1b[0m\nEOF' } as never)
+  await w.clock.advance(0)
+  for (const text of await allTexts(band($))) expect(text).not.toMatch(/[\n\r\t\x1b]/)
+  expect((await bandLines($, 100)).length).toBe(3)
+  await shows(band($, 140), exactly('Bash: git commit -F - <<EOF fix: the thing more detail! EOF'))
+  for (const line of log) expect(line).not.toMatch(/[\n\r\t\x1b]/)
+  expect(log.at(-1)).toContain('Bash: git commit -F - <<EOF')
+  release()
+  await call
+})
+
+test('a helper or task name with new lines stays on one line', async ($, on) => {
+  const w = world(on)
+  w.agents = [{ id: 'a1', description: 'Find\nthe config', type: 'Explore', status: 'running' }]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h1', 'a1')
+  await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'A', status: 'in_progress', activeForm: 'Writing\ntests' }] } as never)
+  for (const text of [...(await allTexts(band($))), ...(await allTexts(pane($)))]) expect(text).not.toMatch(/\n/)
+  await shows(pane($), exactly('Explore · Find the config'))
+  await shows(band($), /Writing tests/)
+})
+
+test('a job that starts without a reading counts only its own cost', async ($, on) => {
+  const w = world(on)
+  await job($, w, 'first', 5.00)
+  w.usageBroken = true
+  await prompt($, 'second')
+  await start($, 'm')
+  w.usageBroken = false
+  await tool($)
+  w.cost = 5.10
+  await step($, w, 'm', 1_000, 0)
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toMatch(/ · 1 step · ≈\$0\.10$/)
+  await shows(pane($), /^last request ≈\$0\.10 · /)
+})
+
+test('the panel\'s reset times count down while idle', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await measure($, [five(30, 5 * 3600_000)])
+  await w.clock.advance(3 * 3600_000)
+  await radarCmd($, 'open')
+  await shows(pane($), /resets in 2h 0m/)
+  await hidden(pane($), /resets in 5h/)
+})
+
+test('a resumed session shows its totals before any prompt: the clock in hours, no last request yet', async ($, on) => {
+  const saved = {
+    v: 1, updatedAt: 0, name: 'old work', nameKind: 'words', cost: 1.5, tokens: 50_000, ms: 7_503_000, steps: 3,
+    helperIds: [], agents: [], earlier: { agents: 0, cost: 0, tokens: 0 }, budgetFired: 0,
+  }
+  const w = world(on, { 'session:s1': saved })
+  await begin($, w)
+  await shows(band($), exactly('2:05:03'), exactly('≈$1.50'), exactly('50k'))
+  await hidden(band($), /last request/)
+  await hidden(pane($), /last request/)
+  // no agent row yet ("No agents yet"): the panel is a little taller than it draws, never shorter
+  await radarCmd($, 'open')
+  const ui: any = await pane($)
+  expect(w.opened.at(-1)).toBeGreaterThanOrEqual(height(await ui.drawn()))
+  await ui.unmount()
+})
+
+const MODELS: Array<[string, string]> = [
+  ['claude-opus-5-5-20260101', 'Opus 5.5'],
+  ['us.anthropic.claude-sonnet-4-5-20250929-v1:0', 'Sonnet 4.5'],
+  ['claude-sonnet-4-5@20250929', 'Sonnet 4.5'],
+  ['claude-opus-4-6[1m]', 'Opus 4.6'],
+  ['claude-3-5-sonnet-20241022', 'Sonnet 3.5'],
+]
+test('model ids from the clouds read plainly; a stand-in like <synthetic> keeps the model', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  const stepWith = async (model: string) => {
+    w.next = { ...usage(1_000, 0), model }
+    for await (const _ of $.turn.step({ turnId: 'm', index: 0, model, messageCount: 1 } as never)) { }
+  }
+  for (const [id, name] of MODELS) {
+    await stepWith(id)
+    await shows(band($), exactly(name))
+  }
+  await stepWith('claude-opus-5-5')
+  await stepWith('<synthetic>')
+  await shows(band($), exactly('Opus 5.5'))
+  await hidden(band($), /synthetic/i)
+})
+
+test('a name cut at an emoji keeps it whole, in the band, the panel and the record', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  await job($, w, 'go', 0.01)
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+  for (const name of ['A'.repeat(26) + '😀😀', 'A'.repeat(79) + '😀']) {
+    await rename($, name)
+    for (const text of [...(await allTexts(band($))), ...(await allTexts(pane($)))]) expect(text).not.toMatch(lone)
+    expect(record(w)?.name).not.toMatch(lone)
+  }
+  expect(record(w)?.name).toBe('A'.repeat(79) + '😀')
+})
+
+const SECRET_NAMES: Array<[string, string]> = [
+  ['use sk-ant-api03-abcdefghijkl to call the api', 'use to call the api'],
+  ['export API_KEY=abc then run', 'export then run'],
+  ['set password: hunter2 for the db', 'set for the db'],
+  ['fix \x07the \x1b[31mred\x1b[0m bug', 'fix the red bug'],
+  ['use ghp_abcdefghijklmnop0123 here', 'use here'],
+]
+test('the automatic name leaves out what looks like a secret, and control characters', { options: { showName: true } }, async ($, on) => {
+  const w = world(on)
+  for (const [i, [text, name]] of SECRET_NAMES.entries()) {
+    w.sid = `x${i}`
+    await job($, w, text, 0.01 * (i + 1))
+    expect(record(w)?.name, text).toBe(name)
+  }
+})
+
+for (const entry of ['*.acme.com=WORK', '.acme.com=WORK', 'WORK=acme.com']) {
+  test(`account labels: ${entry} labels acme.com`, { options: { accounts: [entry], showEmail: false } }, async ($, on) => {
+    const w = world(on, {}, 0, { HOME: '/Users/t' })
+    w.files['/Users/t/.claude.json'] = account('me@acme.com')
+    await job($, w, 'go', 0.01)
+    await shows(band($), exactly('[WORK]'))
+  })
+}
+
+test('a session with nothing in it saves no record', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await w.clock.advance(60_000)
+  await $.session.end({ reason: 'other', sessionId: 's1' } as never)
+  expect(record(w)).toBeUndefined()
+  // a budget alone is something
+  w.sid = 's2'
+  await radarCmd($, 'budget 3')
+  expect(record(w, 's2')).toMatchObject({ budget: 3 })
+})
+
+test('the store keeps the newest 500 sessions; other keys and versions stay', { timeoutMs: 60_000 }, async ($, on) => {
+  const seed: Record<string, unknown> = { 'session:v2': { v: 2, x: 1 }, other: 'keep me' }
+  for (let i = 0; i < 505; i++) {
+    seed[`session:x${i}`] = { v: 1, updatedAt: DAY + i, name: `n${i}`, nameKind: 'words', cost: 0, tokens: 0, ms: 0, steps: 0, helperIds: [] }
+  }
+  const w = world(on, seed, 2 * DAY)
+  await begin($, w)
+  await w.clock.settle()
+  const kept = [...w.store.keys()].filter(key => key.startsWith('session:x'))
+  expect(kept.length).toBe(500)
+  for (let i = 0; i < 5; i++) expect(w.store.has(`session:x${i}`)).toBe(false)
+  expect(w.store.has('session:x5')).toBe(true)
+  expect(w.store.get('session:v2')).toEqual({ v: 2, x: 1 })
+  expect(w.store.get('other')).toBe('keep me')
+})
+
+test('a slow store never holds up the start: old records are read in the background', async ($, on) => {
+  const saved = { v: 1, updatedAt: 0, name: 'n', nameKind: 'words', cost: 0, tokens: 0, ms: 0, steps: 0, helperIds: [] }
+  const w = world(on, { 'session:x1': saved, 'session:x2': saved })
+  w.stuckGet = key => key.startsWith('session:x')
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(band($), /Usage Radar/, exactly('≈$0.01'))
+})
+
+test('old records are pruned once per process, not at every new session', async ($, on) => {
+  const w = world(on)
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await clearTo($, w, 's2')
+  await job($, w, 'more', 0.02)
+  await w.clock.settle()
+  expect(w.keysListed).toBe(1)
+})
+
+test('idle, a prompt checks the spend limit at once; a reading that stops coming still goes stale', async ($, on) => {
+  const w = world(on)
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  expect(w.fetches.length).toBe(1)
+  await w.clock.advance(120_000)
+  expect(w.fetches.length).toBe(1)
+  await prompt($, 'more')
+  await w.clock.advance(0)
+  expect(w.fetches.length).toBe(2)
+  await start($, 'm')
+  await complete($, 'm')
+  // the checks fail from here on; 10 minutes after the last good one the reading says so
+  w.reply = { status: 401, ok: false, text: '' }
+  await w.clock.advance(9 * 60_000)
+  await hidden(band($), /stale/)
+  await w.clock.advance(60_000)
+  await shows(band($), exactly(' · stale'))
+  await shows(pane($), /\$12\.40 of \$100 used · last read over 10m ago/)
+})
+
+test('on Windows the account file is found under USERPROFILE', { options: LABELS }, async ($, on) => {
+  // (an absolute path here: the test kit reads a C:\\ path from its working directory on macOS and Linux)
+  const w = world(on, {}, 0, { USERPROFILE: '/c/Users/t\\' })
+  w.files['/c/Users/t/.claude.json'] = account('you@work.example.com')
+  await job($, w, 'go', 0.01)
+  await shows(band($), /^\[WORK\]/)
+})
+
+test('a laptop asleep mid-job counts at most 30 s of it, for the job and its helper', async ($, on) => {
+  // the engine's clock, moved by hand; while the lid is shut no tick fires
+  let now = 0
+  on('clock.now', () => ({ value: now }) as never)
+  on('clock.every', () => new Promise(() => {}) as never)
+  on('session.id', () => ({ value: 's1' }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 10 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('agent.list', () => ({ value: [helper(1)] }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('prompt.submit', (_$: any, e: any) => ({ text: e.text }) as never)
+  on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }) as never)
+  on('turn.step', async function* (_$: any, e: any) {
+    return { turnId: e.turnId, index: e.index, usage: usage(1_000, 0), stopReason: 'end_turn', answer: '', toolUses: [] }
+  } as never)
+  const stepOf = async (turnId: string, agentId?: string) => {
+    for await (const _ of $.turn.step({ turnId, index: 0, model: 'claude-opus-5-5', messageCount: 1, ...(agentId && { agentId }) } as never)) { }
+  }
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h1', 'a1')
+  now = 5_000
+  await stepOf('m')
+  // two hours later the lid opens: the helper's step is the first thing that happens
+  now = 5_000 + 2 * 3600_000
+  await stepOf('h1', 'a1')
+  const band1 = await allTexts(band($))
+  const jobClock = band1.find(t => /^\d+:\d\d(:\d\d)?$/.test(t)) ?? ''
+  expect(seconds(jobClock), jobClock).toBeGreaterThanOrEqual(5)
+  expect(seconds(jobClock), jobClock).toBeLessThanOrEqual(35)
+  const rows = (await allTexts(pane($))).map(t => /^ {2}\S+ · (\d+:\d\d(?::\d\d)?)/.exec(t)?.[1]).filter((x): x is string => !!x)
+  expect(rows.length).toBe(2)
+  for (const took of rows) expect(seconds(took), took).toBeLessThanOrEqual(35)
+})
+
+test('an idle teammate: no redraw between polls, and it is still seen waking within a second', async ($, on) => {
+  const w = world(on)
+  const log = w.statuses
+  // every write of the state (each one redraws)
+  let writes = 0
+  on('state.set', (_$: any, e: any, next: any) => {
+    writes++
+    return next(e)
+  })
+  w.agents = [{ id: 'a1', description: 'Write plan', type: 'teammate', name: 'alice', status: 'running' }]
+  await prompt($, 'team')
+  await start($, 'm')
+  await start($, 'h', 'a1')
+  await step($, w, 'h', 1_000, 0, 'a1')
+  await complete($, 'm')
+  w.agents[0]!.status = 'idle'
+  await w.clock.advance(2_000)
+  const before = log.length
+  const written = writes
+  await w.clock.advance(10_000)
+  expect(log.length - before).toBeLessThanOrEqual(12)
+  // about two writes a second (the poll's tick moving the clock, and the poll), not one every 250 ms
+  expect(writes - written).toBeLessThanOrEqual(25)
+  await shows(pane($), /idle$/)
+  w.agents[0]!.status = 'running'
+  await w.clock.advance(1_000)
+  await hidden(pane($), /idle$/)
+  await shows(pane($), /Working/)
+})
+
+test('showSpend off: after a /login to another account the badge follows within a minute', { options: { ...LABELS, showSpend: false, showEmail: false } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(band($), exactly('[WORK]'))
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  await w.clock.advance(60_000)
+  await shows(band($), exactly('[PERSONAL]'))
+  await hidden(band($), /WORK/)
+  // a file that can't be read says nothing: the badge stays
+  delete w.files['/Users/t/.claude.json']
+  await w.clock.advance(60_000)
+  await shows(band($), exactly('[PERSONAL]'))
+  expect(w.fetches.length).toBe(0)
+})
+
+test('idle, a /login to another account drops the old dollars within a minute and reads the new ones', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /\$12\.40/)
+  const fetches = w.fetches.length
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(5000, 10000))
+  await w.clock.advance(60_000)
+  expect(w.fetches.length).toBe(fetches + 1)
+  await hidden(pane($), /\$12\.40/)
+  await shows(pane($), /\$50 of \$100 used/)
+})
+
+test('a spend limit with nothing used yet reads $0 used', async ($, on) => {
+  const w = world(on)
+  spendOn(w, { spend: { enabled: true, used: null, limit: { amount_minor: 10000, exponent: 2, currency: 'USD' } }, extra_usage: null })
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /^Spend  \$100 left$/, /^\$0 of \$100 used$/, exactly('0%'))
+  await shows(band($), exactly('$100'), exactly('0%'))
+})
+
+test('extra usage without its decimals counts in cents; with no credits used yet, $0', async ($, on) => {
+  const w = world(on)
+  spendOn(w, { spend: null, extra_usage: { is_enabled: true, monthly_limit: 20000, used_credits: 12000, currency: 'USD' } })
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await shows(pane($), /^Spend  \$80 left$/, /^\$120 of \$200 used$/)
+  spendOn(w, { spend: null, extra_usage: { is_enabled: true, monthly_limit: 20000, used_credits: null, currency: 'USD' } })
+  await minute($, w)
+  await shows(pane($), /^\$0 of \$200 used$/)
+})
+
+// A warning level another terminal shared: when, and the limit's reset time
+const shared = (level: number, at: number, resetsAt?: string) => ({ level, at, ...(resetsAt !== undefined && { resetsAt }) })
+const weekly = (pct: number, resetsAt: string) => ({ kind: 'seven_day', percentUsed: pct, resetsAt })
+
+test('a warning shown here is shared: the level and reset time only, never dollars, the email or context', { options: LABELS }, async ($, on) => {
+  const w = workWorld(on)
+  const resetsAt = new Date(5 * DAY).toISOString()
+  w.limits = [weekly(85, resetsAt)]
+  spendOn(w, SPEND(8400, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  await $.session.measure({ context: { window: 200_000, percent: 90 }, rateLimits: w.limits, changed: ['context'] } as never)
+  await w.clock.settle()
+  expect(w.toasts.filter(t => /^⚠ Weekly 85% used/.test(t)).length).toBe(1)
+  expect(w.toasts.filter(t => /^⚠ Spend 84% used/.test(t)).length).toBe(1)
+  expect(w.toasts.filter(t => /^⚠ Context 90% used/.test(t)).length).toBe(1)
+  const alerts = w.store.get('alerts') as Record<string, any>
+  expect(alerts.seven_day).toMatchObject({ level: 80, resetsAt })
+  expect(alerts.spend_limit).toMatchObject({ level: 80 })
+  expect(alerts.context).toBeUndefined()
+  const all = JSON.stringify(alerts)
+  expect(all).not.toContain('@')
+  expect(all).not.toContain('$')
+  expect(all).not.toContain('84')
+})
+
+for (const [label, seed, now, toasts] of [
+  ['shown before, its window still on: no toast', { seven_day: shared(80, 0, new Date(5 * DAY).toISOString()) }, DAY, 0],
+  ['shown before its window was reset: the toast again', { seven_day: shared(80, 0, new Date(DAY / 2).toISOString()) }, DAY, 1],
+] as const) {
+  test(`a Weekly warning another terminal shared, ${label}`, async ($, on) => {
+    const w = world(on, { alerts: seed }, now)
+    w.limits = [weekly(86, new Date(5 * DAY).toISOString())]
+    await begin($, w)
+    await job($, w, 'go', 0.01)
+    expect(w.toasts.filter(t => /Weekly 86% used/.test(t)).length).toBe(toasts)
+  })
+}
+
+for (const [label, age, toasts] of [['within a day: no toast', 3600_000, 0], ['a day ago: the toast again', DAY, 1]] as const) {
+  test(`a Spend warning another terminal shared ${label}`, async ($, on) => {
+    const w = world(on, { alerts: { spend_limit: shared(80, 2 * DAY - age) } }, 2 * DAY)
+    spendOn(w, SPEND(8400, 10000))
+    await begin($, w)
+    await job($, w, 'go', 0.01)
+    expect(w.toasts.filter(t => /Spend 84% used/.test(t)).length).toBe(toasts)
+  })
+}
+
+test('a prompt a hook beneath drops ends its job: Done, the clock stops, the next prompt starts afresh', async ($, on) => {
+  const w = world(on)
+  const log = w.statuses
+  await job($, w, 'first', 0.01)
+  w.dropPrompt = 'blocked by policy'
+  await prompt($, 'blocked one')
+  await w.clock.advance(0)
+  await shows(band($), exactly('Done'))
+  // the last job's numbers are back: not "≈$0.00 · 0 tokens"
+  await shows(band($), /last request ≈\$0\.01 · 1k tokens · 0:00$/)
+  await hidden(band($), /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] $/)
+  expect(log.at(-1)).toMatch(/^✓ /)
+  const pushed = log.length
+  await w.clock.advance(5_000)
+  expect(log.length).toBe(pushed)
+  w.dropPrompt = null
+  await w.clock.advance(60_000)
+  await prompt($, 'next')
+  await start($, 'm')
+  await step($, w, 'm', 5_000, 0)
+  await shows(pane($), /^last request .* · 5k tokens · 0:00$/)
+})
+
+test('the first prompt of a session that a hook beneath drops leaves nothing running: no ticks, the clock stays', async ($, on) => {
+  const w = world(on)
+  const log = w.statuses
+  await begin($, w)
+  w.dropPrompt = 'blocked by policy'
+  await prompt($, 'blocked first')
+  await w.clock.advance(0)
+  const pushed = log.length
+  await w.clock.advance(5_000)
+  expect(log.length).toBe(pushed)
+  if (log.length) expect(log.at(-1)).toMatch(/^✓ /)
+  w.dropPrompt = null
+  await w.clock.advance(3_600_000)
+  await prompt($, 'next')
+  await start($, 'm')
+  await step($, w, 'm', 5_000, 0)
+  // the hour after the blocked prompt was idle, not working time
+  await hidden(band($), /⏱ 1:0\d:\d\d/)
+})
+
+test('a prompt typed into a running turn that a hook beneath drops changes nothing: the job goes on', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await tool($)
+  w.dropPrompt = 'blocked by policy'
+  await $.prompt.submit({ text: 'also this', origin: { kind: 'composer' }, wait: false, turnId: 'm' } as never)
+  await w.clock.advance(0)
+  w.dropPrompt = null
+  await shows(band($), /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] $/)
+  await hidden(band($), exactly('Done'))
+  await w.clock.advance(2_000)
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toMatch(/^✓ All done in 0:02 · 1 step · /)
+})
+
+test('a turn without text (a continuation after a Stop hook) goes on with the last job', async ($, on) => {
+  const w = world(on)
+  await prompt($, 'go')
+  await start($, 'm')
+  await tool($)
+  await complete($, 'm')
+  expect(w.toasts.at(-1)).toMatch(/ · 1 step · /)
+  // the Stop hook asks for more: a new turn of main, with no prompt and no text
+  await $.turn.start({ turnId: 'm2', text: '' } as never)
+  await tool($)
+  await complete($, 'm2')
+  expect(w.toasts.at(-1)).toMatch(/ · 2 steps · /)
+})
+
+test('idle, an account file that names nobody forces one check, then the 5-minute rhythm', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  delete w.files['/Users/t/.claude.json']
+  for (let i = 0; i < 10; i++) await w.clock.advance(60_000)
+  expect(w.fetchedAt).toEqual([0, 60_000, 360_000])
+  await shows(band($), /^\[WORK\]/)
+})
+
+test('an answer that lands after the minute saw another account is dropped', { options: LABELS }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  spendOn(w, SPEND(1240, 10000))
+  await begin($, w)
+  await job($, w, 'go', 0.01)
+  // a check under the old account: its answer ($30) is slow, then so is its look at the account file
+  spendOn(w, SPEND(3000, 10000))
+  let land = () => {}
+  w.hold = new Promise(r => { land = r })
+  await minute($, w)
+  w.hold = null
+  let open = () => {}
+  w.fileHold = new Promise(r => { open = r })
+  land()
+  await w.clock.advance(0)
+  // meanwhile, /login as someone else: the next minute sees it and reads the new account ($50)
+  w.files['/Users/t/.claude.json'] = account('me@gmail.com')
+  spendOn(w, SPEND(5000, 10000))
+  await w.clock.advance(60_000)
+  await shows(pane($), /\$50 of \$100 used/)
+  // the old check goes on now: its $30 never shows
+  open()
+  await w.clock.advance(0)
+  await shows(pane($), /\$50 of \$100 used/)
+  await hidden(pane($), /\$30 of/)
+})
+
+test('terminal links in a command are left out; a keycap counts as two columns', { options: { ...LABELS, showEmail: false, showName: true } }, async ($, on) => {
+  const w = world(on, {}, 0, { HOME: '/Users/t' })
+  w.files['/Users/t/.claude.json'] = account('you@work.example.com')
+  await prompt($, 'go')
+  await start($, 'm')
+  let release = () => {}
+  w.toolHold = new Promise(r => { release = r })
+  const call = $.tool.call({ tool: 'Bash', command: 'echo \x1b]8;;https://example.com\x07link\x1b]8;;\x1b\\ done' } as never)
+  await w.clock.advance(0)
+  await shows(band($), exactly('Bash: echo link done'))
+  for (const text of await allTexts(band($))) expect(text).not.toMatch(/\x1b|8;;/)
+  release()
+  await call
+  await rename($, '1️⃣'.repeat(20))
+  for (const cols of [40, 60, 100]) {
+    for (const line of await bandLines($, cols)) expect(columns(line), `${cols} columns: ${textOf(line)}`).toBeLessThanOrEqual(cols - 4)
+  }
+  expect(displayWidth('1️⃣')).toBe(2)
+})
+
+test('a dropped prompt takes its new job back whole: the "+2 earlier" line and the record stay as they were', async ($, on) => {
+  const w = world(on)
+  w.agents = Array.from({ length: 10 }, (_, i) => helper(i + 1))
+  await prompt($, 'go')
+  await start($, 'm')
+  w.cost = 0.20
+  await step($, w, 'm', 1_000, 0)
+  for (let i = 1; i <= 10; i++) {
+    await start($, `h${i}`, `a${i}`)
+    await step($, w, `h${i}`, 1_000, 0, `a${i}`)
+    await complete($, `h${i}`, `a${i}`)
+  }
+  await complete($, 'm')
+  await shows(pane($), /^\+2 earlier agents · /)
+  const saved = record(w)
+  w.dropPrompt = 'blocked by policy'
+  await prompt($, 'blocked one')
+  await w.clock.advance(0)
+  await shows(pane($), /^\+2 earlier agents · /)
+  await hidden(pane($), /^\+4 earlier/)
+  await shows(band($), /10 helpers done/, /last request ≈\$0\.20 · 11k tokens/)
+  await $.session.end({ reason: 'other', sessionId: 's1' } as never)
+  expect(record(w)?.earlier).toEqual(saved?.earlier)
+  expect(record(w)?.agents.length).toBe(saved?.agents.length)
+})
+
+test('a prompt dropped while a background helper works leaves main as it was: the job ends with the helper', async ($, on) => {
+  const w = world(on)
+  w.agents = [helper(1)]
+  await prompt($, 'go')
+  await start($, 'm')
+  await start($, 'h1', 'a1')
+  await step($, w, 'h1', 1_000, 0, 'a1')
+  await complete($, 'm')
+  await shows(band($), /^Waiting for 1 helper$/)
+  w.dropPrompt = 'blocked by policy'
+  await prompt($, 'blocked one')
+  await w.clock.advance(0)
+  w.dropPrompt = null
+  await shows(band($), /^Waiting for 1 helper$/)
+  await hidden(band($), /Thinking/)
+  await complete($, 'h1', 'a1')
+  expect(w.toasts.at(-1)).toMatch(/^✓ All done in .* · 2 agents · /)
+  await shows(band($), exactly('Done'))
 })
