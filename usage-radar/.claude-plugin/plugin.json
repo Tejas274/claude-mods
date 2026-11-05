@@ -1,6 +1,6 @@
 {
   "name": "usage-radar",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "description": "Live usage for Claude Code: your spend limit in dollars, plan limits (5-hour, weekly), context fill with alerts, cost, tokens and timer above the prompt, a status line, an Agents panel (/radar), a burn-rate forecast for limits, a session budget (/radar budget) and an account badge with a private mode (/radar private).",
   "types": "./types/index.d.ts",
   "author": { "name": "Tejas Shah" },
@@ -42,6 +42,12 @@
       "description": "Cost budget every new session starts with; 0 = none. Change it per session with /radar budget.",
       "default": 0,
       "min": 0
+    },
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the panel on its own",
+      "description": "Open the panel when Claude starts helper agents, in fullscreen on a wide terminal (never on the main screen or after you closed it). Off: it opens only with /radar.",
+      "default": false
     }
   }
 }

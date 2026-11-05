@@ -51,9 +51,8 @@ export type Earlier = { agents: number; cost: number; tokens: number }
 /** How the session got its name: /rename, a ticket ID in the first prompt, or its first words */
 export type NameKind = 'rename' | 'ticket' | 'words'
 
-/** The signed-in account, read once from the config file (not saved). configDir is never drawn:
- * a config folder name can reveal the company (like ~/.claude-acme) */
-export type Account = { email: string | null; org: string | null; configDir: string }
+/** The signed-in account: read from the config file, never saved or drawn beyond the badge */
+export type Account = { email: string | null; org: string | null }
 
 /** The account's dollar spend limit, from Anthropic's usage endpoint (major units; never saved) */
 export type Spend = { used: number; cap: number; currency: string; pct: number }
