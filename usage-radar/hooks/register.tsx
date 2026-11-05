@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, PromptSubmitInput, Register, Timer, UiOpenResult, UiPane } from 'claude-code'
 
-import type { Account, Agent, Earlier, Limit, Live, NameKind, Pace, Saved, SavedAgent, Spend, Todo, Track } from '../types'
+import type { Account, Agent, Earlier, Limit, Live, NameKind, Pace, Saved, SavedAgent, SharedAlert, Spend, Todo, Track } from '../types'
 
 // ════════════════════════════════════════════════════════════════════════════
 // 1. STATE: everything the screen shows lives in one value. Writing it redraws.
@@ -55,7 +55,9 @@ const TICK_MS = 250
 const POLL_MS = 1000 // while working, cost, limits and the engine's agent list are read this often
 
 // The spend limit in dollars: read from Anthropic with Claude Code's own login, once a minute
+// while working, every 5 minutes while idle
 const SPEND_MS = 60_000
+const SPEND_IDLE_MS = 5 * 60_000
 const SPEND_SLACK_MS = 5_000 // checks are at least SPEND_MS minus this apart, so a tick a bit early still counts
 const SPEND_URL = 'https://api.anthropic.com/api/oauth/usage'
 const SPEND_STUCK_MS = 5 * 60_000 // a reading that never answers stops blocking the next one after this
@@ -64,6 +66,7 @@ const SPEND_HOLD_MAX_MS = 15 * 60_000 // while Anthropic asks us to slow down (4
 const SPEND_STALE_MS = 10 * 60_000 // a reading older than this is marked stale
 const SPEND_JITTER = 0.1 // a wait is up to 10% longer, so many sessions don't all ask at once
 const GONE_MS = 30_000 // a helper listed before and missing this long has ended
+const SLEEP_MS = 30_000 // while working, a longer gap between two clock readings (the laptop slept) counts as this much
 const DOCK_COLUMNS = 110 // the fullscreen layout docks the panel on the right from this width
 
 // The limit forecast: how fast each limit fills while working, over the last 10 minutes of work
@@ -79,11 +82,17 @@ const REARM_MS = 60 * 60_000 // the warnings can come again once it's an hour aw
 // Session totals are saved per session id in $.store, at most every 15 s while working
 const SAVE_MS = 15_000
 const PRUNE_MS = 90 * 24 * 60 * 60 * 1000 // sessions unused for 90 days are forgotten
+const MAX_SESSIONS = 500 // ... and past the newest 500, the oldest go too
 const KEY = (id: string): string => `session:${id}`
 const PRIVATE_KEY = 'private' // /radar private: true or false, for every session (never the email)
 // while Anthropic asks us to slow down: { until, backoffs } only, shared by every session in this
 // config dir; never dollars or the account
 const HOLD_KEY = 'spend-hold'
+// the 80%/95% warnings already shown for the plan and spend limits: { [kind]: { level, resetsAt?, at } },
+// shared by every terminal in this config dir, so a new one doesn't warn again; never dollars or the account
+const ALERTS_KEY = 'alerts'
+const ALERT_TTL_MS = 24 * 60 * 60 * 1000 // a shared warning without a reset time counts for a day
+const SHARED_KINDS = ['five_hour', 'seven_day', 'spend_limit']
 
 // Colours: theme keys, not raw hex, so they stay readable on light and dark terminals
 const ORANGE = 'claude'
@@ -95,9 +104,15 @@ const RED = 'error'
 // 2. HELPERS: plain functions that only turn data into text (no `$` in here)
 // ════════════════════════════════════════════════════════════════════════════
 
-// "claude-opus-5-5-20260101" → "Opus 5.5"
+// "claude-opus-5-5-20260101" → "Opus 5.5"; also a cloud's id ("us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+// "claude-sonnet-4-5@20250929" → "Sonnet 4.5"), "claude-opus-4-6[1m]" → "Opus 4.6", "claude-3-5-sonnet-…" → "Sonnet 3.5"
 const prettyModel = (id: string): string => {
-  const parts = id.replace(/^claude-/, '').split('-').filter(p => !/^\d{8}$/.test(p))
+  const bare = id
+    .replace(/^.*?claude-/, '')
+    .replace(/@.*$/, '')
+    .replace(/-v\d+(:\d+)?$/, '')
+    .replace(/\[[^\]]*\]/g, '')
+  const parts = bare.split('-').filter(p => p && !/^\d{8}$/.test(p))
   const name = parts.filter(p => !/^\d+$/.test(p)).join(' ')
   const version = parts.filter(p => /^\d+$/.test(p)).join('.')
   const title = name.replace(/\b\w/g, c => c.toUpperCase())
@@ -110,9 +125,12 @@ const k = (n: number): string =>
 
 const money = (usd: number | null): string => (usd === null ? '—' : `≈$${usd.toFixed(2)}`)
 
+// 65_000 → "1:05"; from an hour up "2:05:03"
 const clock = (ms: number): string => {
   const s = Math.max(0, Math.floor(ms / 1000))
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+  const ss = String(s % 60).padStart(2, '0')
+  if (s < 3600) return `${Math.floor(s / 60)}:${ss}`
+  return `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${ss}`
 }
 
 const pct = (fraction: number): string => `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`
@@ -128,8 +146,53 @@ const bar = (fraction: number, width: number): { filled: string; empty: string }
   return { filled: '━'.repeat(filled), empty: '━'.repeat(Math.max(0, width - filled)) }
 }
 
-const fit = (text: string, max: number): string =>
-  text.length <= max ? text : text.slice(0, Math.max(0, max - 1)) + '…'
+// How many terminal columns text takes: marks, format and control characters none; emoji and
+// East Asian wide letters 2 (an emoji-looking sign followed by U+FE0F too); anything else 1.
+// When unsure it counts more, never less, so a line never runs past the band
+const ZERO_WIDE = /[\p{Mn}\p{Me}\p{Cf}\p{Cc}]/u
+const WIDE =
+  /[\p{Emoji_Presentation}\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{20000}-\u{3FFFD}]/u
+const PICTO = /\p{Extended_Pictographic}/u
+// the columns of one code point, looking at the ones after it (U+FE0F; a keycap like 1️⃣ is 2)
+const colsAt = (chars: string[], i: number): number => {
+  const c = chars[i] ?? ''
+  if (/^[0-9#*]$/.test(c) && chars[i + 1] === '\uFE0F' && chars[i + 2] === '\u20E3') return 2
+  if (ZERO_WIDE.test(c)) return 0
+  if (WIDE.test(c) || (PICTO.test(c) && chars[i + 1] === '\uFE0F')) return 2
+  return 1
+}
+const cols = (text: string): number => {
+  const chars = Array.from(text)
+  return chars.reduce((n, _, i) => n + colsAt(chars, i), 0)
+}
+
+// At most `max` columns, cut by whole code points (never half an emoji), with "…" when cut
+const fit = (text: string, max: number): string => {
+  if (cols(text) <= max) return text
+  if (max <= 0) return ''
+  const chars = Array.from(text)
+  let out = ''
+  let used = 0
+  for (let i = 0; i < chars.length; i++) {
+    const w = colsAt(chars, i)
+    if (used + w > max - 1) break
+    out += chars[i]
+    used += w
+  }
+  return out + '…'
+}
+
+// The first n code points (never half an emoji)
+const cut = (text: string, n: number): string => Array.from(text).slice(0, n).join('')
+
+// One line of plain text: colour codes and terminal links (OSC 8) out, every run of spaces, new
+// lines, tabs and other control characters one space
+const oneLine = (text: string): string =>
+  text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/[\s\p{Cc}]+/gu, ' ')
+    .trim()
 
 // Relative price of a model (input $/MTok), to split the job's cost fairly
 const modelWeight = (model: string): number => (/haiku/i.test(model) ? 1 : /sonnet/i.test(model) ? 3 : 5)
@@ -218,11 +281,20 @@ const isIdle = (p: Live): boolean => {
 }
 
 // Move the clock to `now`. Time while it stood still doesn't count: the job's start moves along.
-const withNow = (p: Live, now: number): Live => ({
-  ...p,
-  now,
-  startedAt: isIdle(p) ? p.startedAt + Math.max(0, now - p.now) : p.startedAt,
-})
+// While working, a gap over 30 s (the laptop slept) counts only 30 s: the job's start moves along
+// by the rest, and every running agent takes the rest as paused time
+const withNow = (p: Live, now: number): Live => {
+  const gap = Math.max(0, now - p.now)
+  if (isIdle(p)) return { ...p, now, startedAt: p.startedAt + gap }
+  if (gap <= SLEEP_MS) return { ...p, now }
+  const slept = gap - SLEEP_MS
+  return {
+    ...p,
+    now,
+    startedAt: p.startedAt + slept,
+    agents: p.agents.map(a => (a.isRunning && a.pausedAt === null ? { ...a, pausedMs: a.pausedMs + slept } : a)),
+  }
+}
 
 // New tokens of one request: input + cache writes + output. Cache reads are left out:
 // they re-read the same history on every step, so they would count it again and again.
@@ -250,8 +322,9 @@ const sessionAgents = (p: Live): number => (main(p) || p.sessionSteps || p.sessi
 // 1 → "1 step", 3 → "3 steps"
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
-// The session made its first model request (until then there's no last request to show)
-const hasRequest = (p: Live): boolean => p.sessionTokens > 0
+// The session made its first model request in this process (until then there's no last request to
+// show; a session resumed from its record has none until its first job)
+const hasRequest = (p: Live): boolean => p.sessionTokens > 0 && !!main(p)
 
 // Just the last request: "last request ≈$0.20 · 11k tokens · 0:05"
 const lastRequest = (p: Live): string => `last request ${money(jobCost(p))} · ${k(p.jobTokens)} tokens · ${elapsed(p)}`
@@ -270,34 +343,34 @@ const withLedger = (p: Live, ledger: number | null): Live => {
 // A helper's row name: "researcher · Find database config"; a teammate's own name
 // (the name part of its "<name>@<team>" address, whatever its type)
 const agentLabel = (info: { type?: string; description?: string; name?: string; teammateId?: string }): string => {
-  const mate = info.teammateId?.split('@')[0]?.trim()
+  const mate = oneLine(info.teammateId?.split('@')[0] ?? '')
   if (mate) return mate
-  const type = info.type?.trim() ?? ''
-  const description = info.description?.trim() ?? ''
-  if (type === 'teammate') return info.name?.trim() || description || 'Helper'
+  const type = oneLine(info.type ?? '')
+  const description = oneLine(info.description ?? '')
+  if (type === 'teammate') return oneLine(info.name ?? '') || description || 'Helper'
   if (!type) return description || 'Helper'
   if (!description || description.toLowerCase() === type.toLowerCase()) return type
   return `${type} · ${description}`
 }
 
-// Ticket IDs in a prompt, returned in capitals: "DEMO-142" (no leading 0, so not "WEB-01"),
-// "qzx-42" when its letters aren't a plain word like step-2 or python-3, a capitals-only
-// word ID like "USAGE-RADAR" (not "CI-CD", nor plain words like API-KEY, READ-ONLY, NON-NULL),
-// or the ID in a Jira .../browse/ABC-1 link.
-// Never inside a word, a path or another URL; never "UTF-8", "GPT-4"...
+// Ticket IDs in a prompt, returned in capitals: "DEMO-142" or "WEB-123" typed in capitals (no
+// leading 0, so not "WEB-01"), a capitals-only word ID like "USAGE-RADAR"
+// (not "CI-CD", nor plain words like API-KEY, READ-ONLY, NON-NULL, JSON-RPC, AWS-SDK), or the ID
+// in a Jira .../browse/ABC-1 link (any case). Lower case outside a link is words: node-18, step-2.
+// Never inside a word, a path or another URL; never "UTF-8", "GPT-4", "PEP-8"...
 const JIRA_URL = /https?:\/\/\S*?\/browse\/([A-Za-z][A-Za-z0-9_]+-[1-9]\d*)(?![\w-])/g
 const TICKET_NUMBER = /(?<![\w./-])([A-Za-z]{2,})-([1-9]\d*)(?![\w/-])(?!\.\d)/g // not ruby-3.2
 const TICKET_WORDS = /(?<![\w./-])[A-Z]{3,}(?:-[A-Z]{3,})+(?![\w/-])/g
-const NOT_TICKET = /^(UTF|ISO|SHA|MD|HTTP|HTTPS|TLS|SSL|COVID|GPT|ES|IPV|RFC|AES|RSA|UTC|GMT|TODO|FIXME|WIP)-/i
-// a word ID that starts like these is plain words, not a ticket (API-123 with a number still is)
-const NOT_WORD_TICKET = /^(API|READ|NON)-/
-const NOT_A_KEY = ['step', 'python', 'top', 'web', 'page', 'chapter', 'version', 'phase', 'part', 'day', 'week', 'level', 'round']
+const NOT_TICKET = /^(UTF|ISO|SHA|MD|HTTP|HTTPS|TLS|SSL|COVID|GPT|ES|IPV|RFC|AES|RSA|UTC|GMT|TODO|FIXME|WIP|PEP|CVE|ECMA)-/i
+// a word ID with one of these parts is plain words, not a ticket (API-123 with a number still is)
+const NOT_WORD_TICKET =
+  /(^|-)(API|READ|NON|JSON|REST|RPC|GRPC|AWS|GCP|SDK|CLI|HTML|CSS|XML|YAML|SQL|JWT|OAUTH|CRUD|UUID|ASCII|HTTP|HTTPS|URL|URI|DNS|SSH|SSO|MFA)(-|$)/
 const NAME_MAX = 80
 
-// "ABC-1" in capitals is a ticket; in lower case its letters need 3+ and not a plain word
+// "ABC-1" is a ticket only in capitals (any capitals: STEP-2 too); "step-2" in lower case is words
 const isTicketNumber = (m: RegExpMatchArray): boolean => {
   const key = m[1] ?? ''
-  return key === key.toUpperCase() || (key.length >= 3 && !NOT_A_KEY.includes(key.toLowerCase()))
+  return key === key.toUpperCase()
 }
 
 const ticketOf = (text: string): string | null => {
@@ -317,17 +390,45 @@ const firstWords = (text: string, n: number): string | null => {
   return words.replace(/[.,:;!?-]+$/, '') || null
 }
 
+// What looks like a secret goes before a prompt can name the session: API keys (sk-…, ghp_…,
+// xoxb-…, AKIA…), bearer tokens, a link's user and password, JWTs, NAME=value and key/token/secret/password settings, and long runs of
+// base64 or hex (with a digit and a letter, and never across a "/", so a long word, path or link stays)
+const SECRETS: RegExp[] = [
+  /\bsk-[A-Za-z0-9_-]{6,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{6,}/g,
+  /\bxox[a-z]?-[A-Za-z0-9-]{6,}/g,
+  /\bAKIA[0-9A-Z]{12,}/g,
+  /\bBearer\s+\S{16,}/gi,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
+  /\b[A-Z][A-Z0-9_]*=\S*/g,
+  // a key, token, secret or password set to something: "api_key=…", "token:…", "password: …"; after
+  // ": " a key or token only when it looks like one (12+ letters and digits), so "the keyboard:
+  // shortcut" or "the token: limit" stay
+  /\b(?:[\w-]*[_-])?(?:api[_-]?key|key|token|secret|password|passwd)\b\s*(?:=|:(?=\S))\s*\S+/gi,
+  /\b(?:[\w-]*[_-])?(?:secret|password|passwd)\b\s*:\s+\S+/gi,
+  /\b(?:[\w-]*[_-])?(?:api[_-]?key|key|token)\b\s*:\s+(?=\S*\d)(?=\S*[A-Za-z])\S{12,}/gi,
+]
+const LONG_RUN = /[A-Za-z0-9+=_-]{32,}/g
+// a user and password in a link ("https://bob:pw@host/…"): they go, the host stays
+const URL_LOGIN = /:\/\/[^/\s:@]+:[^@\s]+@/g
+const scrub = (text: string): string =>
+  SECRETS.reduce((t, re) => t.replace(re, ' '), text.replace(URL_LOGIN, '://')).replace(LONG_RUN, m =>
+    /\d/.test(m) && /[A-Za-z]/.test(m) ? ' ' : m,
+  )
+
 // A session name from the first prompt: a ticket ID if it has one, else its first 5 words
+// (secrets and control characters left out)
 const autoName = (text: string): { name: string; kind: NameKind } | null => {
-  const ticket = ticketOf(text)
-  if (ticket) return { name: ticket.slice(0, NAME_MAX), kind: 'ticket' }
-  const words = firstWords(text, 5)
-  return words ? { name: words.slice(0, NAME_MAX), kind: 'words' } : null
+  const clean = scrub(oneLine(text))
+  const ticket = ticketOf(clean)
+  if (ticket) return { name: cut(ticket, NAME_MAX), kind: 'ticket' }
+  const words = firstWords(clean, 5)
+  return words ? { name: cut(words, NAME_MAX), kind: 'words' } : null
 }
 
 // /rename always wins; an automatic name only fills an empty one
 const withName = (p: Live, name: string, kind: NameKind): Live =>
-  kind === 'rename' || !p.name ? { ...p, name: name.slice(0, NAME_MAX), nameKind: kind } : p
+  kind === 'rename' || !p.name ? { ...p, name: cut(oneLine(name), NAME_MAX), nameKind: kind } : p
 
 // Count each helper once per session, by its id
 const withHelper = (p: Live, id: string): Live =>
@@ -548,7 +649,8 @@ const fold = (p: Live): Live => {
 
 // A new job: keep main's model and context, and the session's helpers with their frozen
 // numbers; this job's split starts over. The last job's working time moves into the
-// session's time; the other totals already count.
+// session's time; the other totals already count. No reading now (the engine refused): the job
+// starts from the last ledger reading, so it isn't billed the whole session.
 const newJob = (p: Live, now: number, cost: number | null, window: number): Live => {
   const m = main(p)
   const ended = withNow(p, now)
@@ -565,8 +667,8 @@ const newJob = (p: Live, now: number, cost: number | null, window: number): Live
     now,
     steps: 0,
     current: null,
-    costUsd: cost,
-    baseCost: cost ?? 0,
+    costUsd: cost ?? p.lastLedger,
+    baseCost: cost ?? p.lastLedger ?? 0,
     window,
     agents: [
       ...(m ? [{ ...m, isRunning: true, units: 0, tokens: 0, startedAt: now, endedAt: null, pausedAt: null, pausedMs: 0 }] : []),
@@ -654,20 +756,25 @@ const cur = (x: unknown): string => (typeof x === 'string' && /^[A-Z]{3}$/.test(
 const validSpend = (used: number | null, cap: number | null, currency: string): Spend | null =>
   used !== null && cap !== null && cap > 0 && used >= 0 ? { used, cap, currency, pct: (used / cap) * 100 } : null
 
-// The answer's spend limit: its `spend` block, else `extra_usage`; null when it has none
+// The answer's spend limit: its `spend` block, else `extra_usage`; null when it has none.
+// Nothing used yet may come as no amount at all (null or missing): with a cap that counts as 0;
+// `extra_usage` without its decimals counts in cents
 const spendOf = (o: Record<string, unknown>): Spend | null => {
+  const none = (x: unknown): boolean => x === null || x === undefined
   const s = o.spend
   if (isObj(s) && s.enabled === true) {
     const limit = isObj(s.limit) ? s.limit : {}
     const used = isObj(s.used) ? s.used : {}
-    const found = validSpend(amount(s.used), amount(s.limit), cur(limit.currency ?? used.currency))
+    const cap = amount(s.limit)
+    const found = validSpend(none(s.used) && cap !== null ? 0 : amount(s.used), cap, cur(limit.currency ?? used.currency))
     if (found) return found
   }
   const x = o.extra_usage
   if (isObj(x) && x.is_enabled === true) {
-    const d = exp(x.decimal_places)
-    if (d !== null && fin(x.used_credits) && fin(x.monthly_limit)) {
-      const found = validSpend(x.used_credits / 10 ** d, x.monthly_limit / 10 ** d, cur(x.currency))
+    const d = none(x.decimal_places) ? 2 : exp(x.decimal_places)
+    const usedCredits = none(x.used_credits) ? 0 : x.used_credits
+    if (d !== null && fin(usedCredits) && fin(x.monthly_limit)) {
+      const found = validSpend(usedCredits / 10 ** d, x.monthly_limit / 10 ** d, cur(x.currency))
       if (found) return found
     }
   }
@@ -810,25 +917,36 @@ const STALE = ' · stale'
 const bandWidth = (m: Meter): number => {
   const l = m.spend ? spendLeft(m.spend) : null
   const body = l
-    ? `${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}${m.stale ? STALE : ''}`.length
-    : `${m.label} `.length + BAND_BAR + ` ${Math.round(m.pct)}%`.length + (m.pct >= WARN ? 2 : 0)
-  return body + paceText(m).length
+    ? cols(`${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}${m.stale ? STALE : ''}`)
+    : cols(`${m.label} `) + BAND_BAR + cols(` ${Math.round(m.pct)}%`) + (m.pct >= WARN ? cols(` ${glyph(m.pct)}`) : 0)
+  return body + cols(paceText(m))
+}
+
+// One meter in few words, for a band too narrow for the first one in full: "Spend $87.60 left ⚠ 84%",
+// "5h limit 30%" (no bar, no forecast)
+const shortMeter = (m: Meter): string => {
+  const l = m.spend ? spendLeft(m.spend) : null
+  return l ? `${m.label} ${l.text} ${l.title.toLowerCase()} ${levelText(m.pct)}` : `${m.label} ${levelText(m.pct)}`
 }
 
 // The meters that fit on the band's one line (3 spaces apart): Spend first, then Context, then
-// the fullest. The first always stays; they're drawn in their usual order
-const bandMeters = (p: Live, width: number): Meter[] => {
+// the fullest. The first always stays; they're drawn in their usual order. When even the first
+// doesn't fit in full, `compact`: they all go on one short line instead, most wanted first, cut to fit
+const bandMeters = (p: Live, width: number): { shown: Meter[]; compact: boolean } => {
   const all = meters(p)
   const rank = (m: Meter): number => (m.key === 'spend_limit' ? 2 : m.key === 'context' ? 1 : 0)
+  const ranked = [...all].sort((a, b) => rank(b) - rank(a) || b.pct - a.pct)
+  const first = ranked[0]
+  if (first && bandWidth(first) > width) return { shown: ranked, compact: true }
   const kept: Meter[] = []
   let used = 0
-  for (const m of [...all].sort((a, b) => rank(b) - rank(a) || b.pct - a.pct)) {
+  for (const m of ranked) {
     const w = bandWidth(m) + (kept.length ? 3 : 0)
     if (kept.length && used + w > width) break
     kept.push(m)
     used += w
   }
-  return all.filter(m => kept.includes(m))
+  return { shown: all.filter(m => kept.includes(m)), compact: false }
 }
 
 // Which meters crossed 80% or 95% since the last reading: one alert per level
@@ -883,6 +1001,44 @@ const withUsage = (
   return { next: b.next, alerts: [...alerts, ...b.alerts] }
 }
 
+// What the engine reports of the session: its cost ledger, limits and context
+type Usage = Awaited<ReturnType<EngineInterface['session']['usage']>>
+
+// A job starts (a prompt you typed, or the turn of a command that asks the model), or goes on while
+// helpers still work; `usage`: a reading now, or null (the engine refused: the job still starts,
+// the next reading catches up)
+const jobFrom = (p: Live, now: number, usage: Usage | null): { next: Live; alerts: string[] } => {
+  const cost = usage?.cost?.usd ?? null
+  const q = withLedger(p, cost)
+  const job = anyRunning(q)
+    ? withAgent({ ...withNow(q, now), isRunning: true }, 'main', a => ({ ...a, isRunning: true, thisJob: true }))
+    : newJob(q, now, cost, usage?.context.window || 200_000)
+  // from idle: the time since the last reading (you thinking, typing) isn't working time,
+  // nor what a limit rose meanwhile; the forecast's clock picks up from here
+  const base = isIdle(q) ? { ...job, pace: { ...job.pace, wall: null } } : job
+  if (!usage) return { next: base, alerts: [] }
+  return withUsage(base, usage.rateLimits, usage.context.percent, now)
+}
+
+// The job as it was in `before` (a dropped prompt's new job taken back): every field a new job
+// sets, the folded helpers' line too. The rest stays as `p` has it: the readings since (cost
+// ledger, limits, context, pace), the warnings shown, the name, the account, the spend
+const withJobOf = (p: Live, before: Live): Live => ({
+  ...p,
+  isRunning: before.isRunning,
+  startedAt: before.startedAt,
+  now: before.now,
+  steps: before.steps,
+  current: before.current,
+  costUsd: before.costUsd,
+  baseCost: before.baseCost,
+  window: before.window,
+  agents: before.agents,
+  earlier: before.earlier,
+  priorMs: before.priorMs,
+  jobTokens: before.jobTokens,
+})
+
 // ── The session budget ─────────────────────────────────────────────────
 // Which warning a spend has reached: 0, 80 (% of the budget) or 100
 const budgetLevel = (spent: number, budget: number): number => (spent >= budget ? 100 : spent >= 0.8 * budget ? 80 : 0)
@@ -908,14 +1064,20 @@ const withBudgetSet = (p: Live, budget: number | null): Live => ({
   budgetFired: budget === null ? 0 : budgetLevel(p.sessionCost, budget),
 })
 
-// "/radar budget …": "" shows it, off/none/0 turns it off, "5" or "$2.50" sets it; null: can't read it
+// "/radar budget …": "" shows it, off/none/0 turns it off, "5", "$2.50", "2,50", ".5" or "1,000"
+// sets it (from $0.01 to $1,000,000); null: can't read it
 const parseBudgetArg = (arg: string): number | 'show' | 'off' | null => {
   const a = arg.trim()
   if (!a) return 'show'
-  if (/^(off|none|0)$/i.test(a)) return 'off'
-  const m = /^\$?(\d+(?:\.\d+)?)$/.exec(a)
-  const n = m ? Number(m[1]) : NaN
-  return n > 0 && n <= 1_000_000 ? n : null
+  let s = a.replace(/^\$/, '')
+  if (/^(off|none|0)$/i.test(s)) return 'off'
+  // "1,000" or "1,234.50": commas group thousands; "2,50": the comma is the decimal point
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '')
+  else if (/^\d*,\d{1,2}$/.test(s)) s = s.replace(',', '.')
+  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(s)) return null
+  const n = Number(s)
+  // at least a cent: anything less would show as $0.00, already past 100%
+  return n >= 0.01 && n <= 1_000_000 ? n : null
 }
 
 // ── Options and the account badge ───────────────────────────────────────
@@ -931,19 +1093,27 @@ type Config = {
 }
 const configOf = (o: PluginOptions): Config => {
   const raw = o.accounts
-  // one entry per item, or one text with entries split by commas, semicolons or new lines
+  // one entry per item, or one text with entries split by commas, semicolons or new lines. A leading
+  // "*." or "." on the domain goes (subdomains match anyway); one written the other way round
+  // (WORK=example.com) is read as example.com=WORK
   const items: unknown[] = Array.isArray(raw) ? [...raw] : [raw]
   const accounts = items
     .flatMap(x => (typeof x === 'string' ? x.split(/[,;\n]/) : []))
     .map(x => /^\s*@?([^=:\s]+)\s*[=:]\s*(.+?)\s*$/.exec(x))
-    .flatMap(m => (m && m[1] && m[2] ? [{ domain: m[1].toLowerCase(), label: m[2] }] : []))
+    .flatMap(m => {
+      if (!m || !m[1] || !m[2]) return []
+      const reversed = !m[1].includes('.') && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(m[2])
+      const domain = (reversed ? m[2] : m[1]).toLowerCase().replace(/^\*?\./, '')
+      const label = reversed ? m[1] : m[2]
+      return domain ? [{ domain, label }] : []
+    })
   const budget = o.defaultBudget
   return {
     accounts,
     showAccount: o.showAccount !== false,
     showEmail: o.showEmail !== false,
     showName: o.showName !== false,
-    defaultBudget: typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? budget : null,
+    defaultBudget: typeof budget === 'number' && Number.isFinite(budget) && budget >= 0.01 ? budget : null,
     showSpend: o.showSpend !== false,
     // off unless asked: an unasked panel can paint over the prompt in some terminal layouts
     autoOpen: o.autoOpen === true,
@@ -996,14 +1166,18 @@ const parseAccountFile = (text: string): { email: string | null; org: string | n
   }
 }
 
-// What Claude is doing right now, e.g. "Bash: npm test"
+// What Claude is doing right now, e.g. "Bash: npm test", on one line (a command with new lines
+// in it, like a commit message, too)
 const describe = (e: { tool: string } & Record<string, unknown>): string => {
   const s = (key: string) => (typeof e[key] === 'string' ? (e[key] as string) : '')
-  if (e.tool === 'Bash') return `Bash: ${s('command')}`
-  if (s('file_path')) return `${e.tool}: ${s('file_path').split('/').slice(-2).join('/')}`
-  if (s('description')) return `${e.tool}: ${s('description')}`
-  if (s('pattern')) return `${e.tool}: ${s('pattern')}`
-  return e.tool
+  const what = (): string => {
+    if (e.tool === 'Bash') return `Bash: ${s('command')}`
+    if (s('file_path')) return `${e.tool}: ${s('file_path').split('/').slice(-2).join('/')}`
+    if (s('description')) return `${e.tool}: ${s('description')}`
+    if (s('pattern')) return `${e.tool}: ${s('pattern')}`
+    return e.tool
+  }
+  return oneLine(what())
 }
 
 // Keep Claude's to-do list in sync, from either to-do tool
@@ -1029,10 +1203,10 @@ const nextTodos = (todos: Todo[], tool: string, input: Record<string, any>, resu
   return todos
 }
 
-// What the job is doing, in a few words
+// What the job is doing, in a few words (a tool call still on its way once the job is done isn't)
 const activity = (p: Live): string => {
   const working = helpers(p).filter(a => a.isRunning).length
-  if (p.current) return p.current
+  if (p.isRunning && p.current) return p.current
   if (main(p)?.isRunning) return 'Thinking…'
   if (working > 0) return `Waiting for ${working} helper${working > 1 ? 's' : ''}`
   return 'Done'
@@ -1067,6 +1241,10 @@ const save = async ($: EngineInterface): Promise<void> => {
   try {
     const p = await read($, live)
     if (!p.sessionId || p.sessionId === keepOff) return
+    // a session with nothing in it (no prompt yet, a -p run that did nothing): no record
+    const empty =
+      !p.sessionSteps && !p.sessionTokens && !p.sessionCost && !p.helperIds.length && !p.name && !p.budgetChosen
+    if (empty) return
     const now = await $.clock.now()
     savedAt = now
     await $.store.set(KEY(p.sessionId), toSaved(p, now))
@@ -1121,19 +1299,32 @@ const loadPrivate = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-// Forget sessions not used for 90 days (and records we can't read). Other keys are left alone,
-// and so is another version's record: a shape we don't read, not a broken one (a downgrade or
-// a mixed install keeps its --resume history)
+// Forget sessions not used for 90 days (and records we can't read), and past the newest 500
+// (this one counts among them) the oldest. Other keys are left alone, and so is another version's
+// record: a shape we don't read, not a broken one (a downgrade or a mixed install keeps its
+// --resume history). Runs once per process, in the background. Never throws
+let pruned = false
 const prune = async ($: EngineInterface, current: string): Promise<void> => {
   try {
     const now = await $.clock.now()
-    for (const key of await $.store.keys()) {
+    const keys = await $.store.keys()
+    const kept: { key: string; at: number }[] = []
+    for (const key of keys) {
       if (!key.startsWith('session:') || key === KEY(current)) continue
       try {
         const raw = await $.store.get(key)
         if (otherVersion(raw)) continue
         const saved = parseSaved(raw)
         if (!saved || now - saved.updatedAt > PRUNE_MS) await $.store.delete(key)
+        else kept.push({ key, at: saved.updatedAt })
+      } catch {
+        // try again next time
+      }
+    }
+    const room = keys.includes(KEY(current)) ? MAX_SESSIONS - 1 : MAX_SESSIONS
+    for (const { key } of kept.sort((a, b) => b.at - a.at).slice(room)) {
+      try {
+        await $.store.delete(key)
       } catch {
         // try again next time
       }
@@ -1144,7 +1335,8 @@ const prune = async ($: EngineInterface, current: string): Promise<void> => {
 }
 
 // The signed-in account, from Claude Code's account file: $CLAUDE_CONFIG_DIR/.claude.json,
-// else ~/.claude.json. Only the email and organization are kept, and never saved. Never throws.
+// else ~/.claude.json (home is %USERPROFILE% on Windows, where HOME isn't set). Only the email
+// and organization are kept, and never saved. Never throws.
 const detectAccount = async ($: EngineInterface): Promise<Account> => {
   let dir: string | undefined
   let home: string | undefined
@@ -1158,7 +1350,15 @@ const detectAccount = async ($: EngineInterface): Promise<Account> => {
   } catch {
     // ignore
   }
-  const file = dir ? `${dir.replace(/\/+$/, '')}/.claude.json` : home ? `${home.replace(/\/+$/, '')}/.claude.json` : null
+  if (!home) {
+    try {
+      home = (await $.env.get('USERPROFILE'))?.trim() || undefined
+    } catch {
+      // ignore
+    }
+  }
+  const base = dir ?? home
+  const file = base ? `${base.replace(/[\\/]+$/, '')}/.claude.json` : null
   let found: { email: string | null; org: string | null } = { email: null, org: null }
   if (file) {
     try {
@@ -1226,9 +1426,9 @@ const nameSession = async ($: EngineInterface, cfg: Config, name: string, kind: 
   await resizeIfChanged($, before, after, cfg)
 }
 
-// ── The spend limit, read from Anthropic once a minute (also while idle) ──
+// ── The spend limit, read from Anthropic once a minute while working, every 5 while idle ──
 let spendTimer: Timer | undefined
-let spendAt: number | null = null // when the last check started, so checks stay a minute apart
+let spendAt: number | null = null // when the last check started, so checks stay apart
 let spendBusyAt: number | null = null // a check on its way since then (null: none)
 let spendCheck = 0 // which check is the latest, so a late answer of an older one is dropped
 let spendMisses = 0 // failed checks in a row; the last reading is kept until SPEND_MISSES
@@ -1272,23 +1472,81 @@ const named = (a: Account | null): a is Account => a !== null && (a.email !== nu
 const switched = (was: Account | null, now: Account): boolean =>
   named(was) && named(now) && (now.email !== was.email || now.org !== was.org)
 
-// Put a reading (or none) on screen, with its alerts; `account`: the login changed to this one
-const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, account?: Account): Promise<void> => {
+// The plan and spend limits' warnings another terminal in this config dir already showed: taken
+// where this process has none for that limit yet, while its window lasts (its reset time is still
+// ahead; with none, for a day). Never throws
+const loadAlerts = async ($: EngineInterface): Promise<void> => {
+  try {
+    const raw = await $.store.get(ALERTS_KEY)
+    if (!isObj(raw)) return
+    const now = await $.clock.now()
+    const shown: Record<string, number> = {}
+    for (const kind of SHARED_KINDS) {
+      const a = raw[kind]
+      if (!isObj(a) || (a.level !== WARN && a.level !== DANGER) || !fin(a.at)) continue
+      const reset = typeof a.resetsAt === 'string' ? Date.parse(a.resetsAt) : NaN
+      if (Number.isFinite(reset) ? reset > now : now - a.at < ALERT_TTL_MS) shown[kind] = a.level
+    }
+    if (Object.keys(shown).length === 0) return
+    await update($, live, p => {
+      const missing = Object.keys(shown).filter(kind => p.alerted[kind] === undefined)
+      if (missing.length === 0) return p
+      return { ...p, alerted: { ...p.alerted, ...Object.fromEntries(missing.map(kind => [kind, shown[kind] ?? 0])) } }
+    })
+  } catch {
+    // none taken: a warning may show again here
+  }
+}
+
+// Share the levels that changed (with the limit's reset time, never dollars or the account), so a
+// new terminal doesn't warn again. The other limits' entries stay as another terminal left them. Never throws
+const shareAlerts = async ($: EngineInterface, after: Live, kinds: string[]): Promise<void> => {
+  try {
+    const now = await $.clock.now()
+    const raw = await $.store.get(ALERTS_KEY)
+    const out: Record<string, SharedAlert> = {}
+    for (const kind of SHARED_KINDS) {
+      const old = isObj(raw) ? raw[kind] : undefined
+      if (!kinds.includes(kind)) {
+        if (isObj(old)) out[kind] = old as SharedAlert
+        continue
+      }
+      const resetsAt = meters(after).find(m => m.key === kind)?.resetsAt
+      out[kind] = { level: after.alerted[kind] ?? 0, ...(resetsAt && { resetsAt }), at: now }
+    }
+    await $.store.set(ALERTS_KEY, out)
+  } catch {
+    // not shared this time: another terminal may warn once more
+  }
+}
+
+// Pop the alerts, and share the plan and spend limits' warning levels when one changed
+const shout = ($: EngineInterface, alerts: string[], before: Record<string, number>, after: Live): void => {
+  for (const a of alerts) $.ui.toast(a)
+  const changed = SHARED_KINDS.filter(kind => (before[kind] ?? 0) !== (after.alerted[kind] ?? 0))
+  if (changed.length > 0) void shareAlerts($, after, changed)
+}
+
+// Put a reading (or none) on screen, with its alerts; `account`: the login changed to this one.
+// `now`: when it was read (the alert's "resets in" counts from then, also while idle)
+const putSpend = async ($: EngineInterface, cfg: Config, spend: Spend | null, account?: Account, now = 0): Promise<void> => {
   const before = await read($, live)
   let alerts: string[] = []
+  let was = before.alerted
   const after = await update($, live, p => {
     // update may run this more than once: only the last run's outcome counts
     alerts = []
+    was = p.alerted
     // a reading (or none) is never stale
     const withAccount = account ? { ...p, account } : p
     const base = withAccount.spendStale ? { ...withAccount, spendStale: false } : withAccount
     if (sameSpend(p.spend, spend)) return base
     const q: Live = { ...base, spend }
-    const r = meterAlerts(q, p.alerted, p.now)
+    const r = meterAlerts(q, p.alerted, Math.max(p.now, now))
     alerts = r.alerts
     return { ...q, alerted: r.alerted }
   })
-  for (const a of alerts) $.ui.toast(a)
+  shout($, alerts, was, after)
   if (after !== before) $.ui.status(statusLine(after))
   // the Spend row or its dollars (or the account's badge) came or went: an open panel takes its new height
   if (panelRows(before, cfg) !== panelRows(after, cfg)) await resizeIfOpen($, after, cfg)
@@ -1319,14 +1577,15 @@ const clearHold = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-// Read the spend limit, at most once a minute (from the minute timer, or an event: start, a prompt,
-// a measure) and one check at a time. Nothing drawn (a -p run, an SDK session no client attached
-// to yet): no request. A busy answer (429, 5xx) keeps the last reading and holds the next request
-// back as Anthropic asks (else 2, 4, 8, then 15 minutes), and every session in this config dir
-// waits with it; a reading over 10 minutes old is marked stale. Another failed check keeps the
-// last reading; the third in a row drops it. An answer without a spend limit, or another login
-// (no claude login, another account), drops it at once.
-const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
+// Read the spend limit, at most once every `every` (a minute from an event: start, a prompt, a
+// measure; from the minute timer a minute while working, 5 minutes while idle) and one check at a
+// time. Nothing drawn (a -p run, an SDK session no client attached to yet): no request. A busy
+// answer (429, 5xx) keeps the last reading and holds the next request back as Anthropic asks
+// (else 2, 4, 8, then 15 minutes), and every session in this config dir waits with it; a reading
+// over 10 minutes old is marked stale (checked every minute). Another failed check keeps the last
+// reading; the third in a row drops it. An answer without a spend limit, or another login (no
+// claude login, another account), drops it at once.
+const refreshSpend = async ($: EngineInterface, cfg: Config, every = SPEND_MS): Promise<void> => {
   if (!cfg.showSpend) return
   let now: number | null = null
   try {
@@ -1337,7 +1596,7 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
       await update($, live, p => (p.spend && !p.spendStale ? { ...p, spendStale: true } : p))
     }
     if (spendBusyAt !== null && now - spendBusyAt < SPEND_STUCK_MS) return
-    if (spendAt !== null && now >= spendAt && now - spendAt < SPEND_MS - SPEND_SLACK_MS) return
+    if (spendAt !== null && now >= spendAt && now - spendAt < every - SPEND_SLACK_MS) return
     spendAt = spendBusyAt = now
     const check = ++spendCheck
     const login = await loginOf($)
@@ -1345,7 +1604,7 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
     if (login === 'none') {
       spendMisses = spendBackoffs = 0
       spendHoldUntil = null
-      return await putSpend($, cfg, null)
+      return await putSpend($, cfg, null, undefined, now)
     }
     let got: SpendAnswer = { ok: false, busy: false }
     let gate: { until: number; backoffs: number } | null = null
@@ -1356,7 +1615,7 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
         spendMisses = spendBackoffs = 0
         spendHoldUntil = null // the hold was the old account's
         await clearHold($)
-        await putSpend($, cfg, null, who)
+        await putSpend($, cfg, null, who, now)
       }
       // Anthropic asked us to wait: no request until then (the reading stays)
       if (spendHoldUntil !== null && now < spendHoldUntil) return
@@ -1380,7 +1639,7 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
         spendHoldUntil = null
         spendAt = null // the next tick or event checks the new account right away
         await clearHold($)
-        return await putSpend($, cfg, null, after)
+        return await putSpend($, cfg, null, after, now)
       }
     }
     if (got.ok) {
@@ -1389,7 +1648,9 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
       spendOkAt = got.spend ? now : null
       // a check got through: the shared wait is over
       if (gate) await clearHold($)
-      return await putSpend($, cfg, got.spend)
+      // the account changed meanwhile (the minute's look at the account file): this answer is the old one's
+      if (check !== spendCheck) return
+      return await putSpend($, cfg, got.spend, undefined, now)
     }
     // busy: wait longer each time, keep the reading (not a miss); the other sessions wait too
     if (got.busy) {
@@ -1405,7 +1666,7 @@ const refreshSpend = async ($: EngineInterface, cfg: Config): Promise<void> => {
     }
     spendMisses++
     if (spendMisses < SPEND_MISSES) return
-    await putSpend($, cfg, null)
+    await putSpend($, cfg, null, undefined, now)
   } catch {
     // ignore: the next check tries again
   } finally {
@@ -1430,14 +1691,67 @@ const syncPrivate = async ($: EngineInterface, cfg: Config): Promise<void> => {
   }
 }
 
+// The account file, read again once a minute: after a /login to another account the badge follows
+// (also with showSpend off), the old account's dollars and hold go, and the spend check runs right
+// away. A file that names nobody now (or can't be read) never clears the badge: one check right
+// away (only the first minute it does), and that check's login decides. Never throws
+let accountGone = false // the account file stopped naming the account on screen (checked once)
+const syncAccount = async ($: EngineInterface, cfg: Config): Promise<void> => {
+  if (!cfg.showAccount && !cfg.showSpend) return
+  try {
+    const who = await detectAccount($)
+    const was = (await read($, live)).account
+    if (switched(was, who)) {
+      spendCheck++ // an answer on its way is the old account's: dropped
+      spendOkAt = spendHoldUntil = spendAt = spendBusyAt = null
+      spendBackoffs = spendMisses = 0
+      await clearHold($)
+      await putSpend($, cfg, null, who, await $.clock.now())
+      accountGone = false
+    } else if (named(who)) accountGone = false
+    else if (named(was) && !accountGone) {
+      // the file names nobody now (a logout?): one check right away, whose login decides
+      accountGone = true
+      spendAt = null
+    }
+  } catch {
+    // ignore: the next minute reads it again
+  }
+}
+
+// While idle the clock still moves, so the panel's reset times count down (a job's ticker moves
+// it while working). Never throws
+const idleNow = async ($: EngineInterface): Promise<void> => {
+  try {
+    const t = await $.clock.now()
+    await update($, live, p => (p.isRunning || t <= p.now ? p : withNow(p, t)))
+  } catch {
+    // ignore: the next minute or reading moves it
+  }
+}
+
+// Each minute, in turn: the account, the clock while idle, then the spend check (a minute apart
+// while working, 5 minutes while idle). Never throws
+const minute = async ($: EngineInterface, cfg: Config): Promise<void> => {
+  await syncAccount($, cfg)
+  await idleNow($)
+  let running = false
+  try {
+    running = (await read($, live)).isRunning
+  } catch {
+    // counts as idle
+  }
+  await refreshSpend($, cfg, running ? SPEND_MS : SPEND_IDLE_MS)
+}
+
 // The minute timer: private mode from other terminals (also with showSpend off, so an idle session
-// picks it up), and the spend check now and once a minute (refreshSpend does nothing with
-// showSpend off)
+// picks it up), the account, and the spend check now and then each minute (refreshSpend does
+// nothing with showSpend off)
 const startSpend = ($: EngineInterface, cfg: Config) => {
   stopSpend()
   spendTimer = $.clock.every(SPEND_MS, () => {
     void syncPrivate($, cfg)
-    void refreshSpend($, cfg)
+    void minute($, cfg)
   })
   void refreshSpend($, cfg)
 }
@@ -1514,7 +1828,11 @@ const syncSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
     await update($, live, q =>
       q.sessionId === id ? q : freshSession(q, id, saved, ledger, cfg.defaultBudget, q.sessionId === null && carried !== null),
     )
-    await prune($, id)
+    // old records go in the background, once per process: a slow store never holds up the session
+    if (!pruned) {
+      pruned = true
+      void prune($, id)
+    }
   } catch {
     // no session id: keep counting as before
   }
@@ -1531,6 +1849,7 @@ let sessionGen = 0 // which session this is: session.end moves it on, so a start
 const startSession = async ($: EngineInterface, cfg: Config): Promise<void> => {
   const gen = sessionGen
   await loadPrivate($) // first: a private email is never drawn
+  await loadAlerts($) // warnings another terminal already showed don't come again here
   await syncSession($, cfg)
   // the session ended meanwhile: start no timer (the next session starts its own)
   if (gen !== sessionGen) return
@@ -1577,6 +1896,15 @@ const nameFrom = async ($: EngineInterface, e: PromptSubmitInput): Promise<{ nam
   return autoName(e.text)
 }
 
+// A reading of the session now, or null when the engine refused. Never throws
+const readUsage = async ($: EngineInterface): Promise<Usage | null> => {
+  try {
+    return await $.session.usage()
+  } catch {
+    return null
+  }
+}
+
 // ── The clock while working ─────────────────────────────────────────────
 let ticker: Timer | undefined // the clock while a job runs
 let tickerId = 0 // which ticker is the current one, so a late tick of an old one can't stop it
@@ -1595,7 +1923,7 @@ const finishJob = async ($: EngineInterface, p: Live, isAborted: boolean): Promi
   const crew = jobHelpers(p).length
   if (p.steps > 0 || crew > 0) {
     $.ui.toast(
-      `${isAborted ? '■ Stopped' : '✓ All done'} in ${elapsed(p)}${crew ? ` · ${crew + 1} agents` : ''} · ${p.steps} steps · ${money(jobCost(p))}`,
+      `${isAborted ? '■ Stopped' : '✓ All done'} in ${elapsed(p)}${crew ? ` · ${crew + 1} agents` : ''} · ${plural(p.steps, 'step')} · ${money(jobCost(p))}`,
     )
   }
 }
@@ -1619,10 +1947,12 @@ const poll = async ($: EngineInterface, now: number): Promise<void> => {
   }
   let alerts: string[] = []
   let ended = false
+  let was: Record<string, number> = {}
   const p = await update($, live, p => {
     // update may run this more than once: only the last run's outcome counts
     ended = false
     alerts = []
+    was = p.alerted
     if (!p.isRunning) return p
     let q = withLedger(p, usage?.cost?.usd ?? null)
     if (usage) {
@@ -1639,21 +1969,27 @@ const poll = async ($: EngineInterface, now: number): Promise<void> => {
     }
     return q
   })
-  for (const a of alerts) $.ui.toast(a)
+  shout($, alerts, was, p)
   $.ui.status(statusLine(p))
   if (ended) await finishJob($, p, false)
 }
 
-// The clock: ticks until the whole job is done, and polls every POLL_MS
+// The clock: ticks until the whole job is done, and polls every POLL_MS. While every running agent
+// is idle (teammates waiting) the clock stands still: no redraw between polls, and the poll's own
+// status line is the one each second (it still sees one wake up)
 const tick = async ($: EngineInterface, id: number): Promise<void> => {
   try {
     if (id !== tickerId) return
     const t = await $.clock.now()
+    const due = t - polledAt >= POLL_MS || t < polledAt
+    const q = await read($, live)
+    const idle = q.isRunning && isIdle(q)
+    if (idle && !due) return
     const p = await update($, live, p => (p.isRunning ? withNow(p, t) : p))
     if (id !== tickerId) return
     if (!p.isRunning) return stopTicker()
-    $.ui.status(statusLine(p))
-    if (t - polledAt >= POLL_MS || t < polledAt) {
+    if (!idle) $.ui.status(statusLine(p))
+    if (due) {
       polledAt = t
       await poll($, t)
     }
@@ -1777,7 +2113,9 @@ export const register: Register = (on, options) => {
           return { text: how === 'refused' ? replies.refused : replies.closed }
         }
         paneDismissed = false
-        const r = await openPane($, await read($, live), cfg)
+        // the clock catches up first (it stands still while idle), so reset times count from now
+        const t = await $.clock.now()
+        const r = await openPane($, await update($, live, p => (p.isRunning || t <= p.now ? p : withNow(p, t))), cfg)
         if (r === null) return { text: "Usage Radar couldn't open its panel here." }
         if (!r.isPlaced) return { text: `Usage Radar is open but not drawn here yet: ${r.reason}` }
         const where =
@@ -1789,7 +2127,9 @@ export const register: Register = (on, options) => {
       }
       await syncSession($, cfg)
       const arg = parseBudgetArg(m[1] ?? '')
-      if (arg === null) return { text: 'Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50), or off.' }
+      if (arg === null) {
+        return { text: 'Usage Radar: /radar budget takes an amount in dollars (like 5 or 2.50, at least $0.01), or off.' }
+      }
       if (arg === 'show') {
         const p = await read($, live)
         return {
@@ -1839,44 +2179,77 @@ export const register: Register = (on, options) => {
       }
     }
 
-    // slash commands like /radar don't start a new job
+    // a slash command starts no job here: one that asks the model (/feature, /review, a skill)
+    // starts it when its turn starts; a built-in that doesn't (/radar, /clear, /config) never does
     if (e.command) {
       await resizeIfChanged($, before, await read($, live), cfg)
       return next(e)
     }
     const now = await $.clock.now()
-    // no reading (the engine refused): the job still starts, the next reading catches up
-    let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
-    try {
-      usage = await $.session.usage()
-    } catch {
-      // ignore
-    }
-    const cost = usage?.cost?.usd ?? null
-    const window = usage?.context.window || 200_000
+    const usage = await readUsage($)
 
     let alerts: string[] = []
+    let was: Record<string, number> = {}
+    // the session as this prompt found it, and whether it starts a new job (else main joins the one
+    // its helpers still work on)
+    let prev = null as Live | null
+    let startsJob = false
     const p = await update($, live, p => {
-      const q = withLedger(p, cost)
-      const job = anyRunning(q)
-        ? withAgent({ ...withNow(q, now), isRunning: true }, 'main', a => ({ ...a, isRunning: true, thisJob: true }))
-        : newJob(q, now, cost, window)
-      // from idle: the time since the last reading (you thinking, typing) isn't working time,
-      // nor what a limit rose meanwhile; the forecast's clock picks up from here
-      const base = isIdle(q) ? { ...job, pace: { ...job.pace, wall: null } } : job
-      if (!usage) return base
-      const r = withUsage(base, usage.rateLimits, usage.context.percent, now)
+      was = p.alerted
+      prev = p
+      startsJob = !anyRunning(p)
+      const r = jobFrom(p, now, usage)
       alerts = r.alerts
       return r.next
     })
     $.ui.status(statusLine(p))
-    for (const a of alerts) $.ui.toast(a)
+    shout($, alerts, was, p)
     await resizeIfChanged($, before, p, cfg)
 
     // the clock: ticks until the whole job is done
     startTicker($)
 
-    return next(e)
+    const r = await next(e)
+    // the prompt never entered (a settings hook beneath blocked it): no turn comes, so what it did
+    // to the job is put back. A new job is taken back: the last job's last request, time and rows
+    // (the "+N earlier" line too) are on screen again; or main, which joined a job its helpers still
+    // work on, is as it was. Main already working (a prompt typed into its turn): nothing to put
+    // back. The readings the prompt took stay: the cost ledger, limits, context, the forecast's pace
+    // and the warnings already shown. (`next` is replay-safe: a failure here never sends the prompt again)
+    const undo = prev
+    const tookBack = startsJob
+    if (r.drop !== undefined && undo && !main(undo)?.isRunning) {
+      try {
+        const t = await $.clock.now()
+        const q = await update($, live, p => {
+          const m = main(p)
+          // (a job this prompt started with no main row yet, the first prompt of a session or after a
+          // resume, still gets taken back below)
+          if (!tookBack && !m?.isRunning) return p
+          const mainBefore = main(undo)
+          // something happened meanwhile (in a new job a step, a tool or a helper; main's own
+          // tokens): that stays, main just finishes
+          const busy = tookBack
+            ? p.steps > 0 || p.jobTokens > 0 || jobHelpers(p).length > 0
+            : !!m && (m.tokens !== (mainBefore?.tokens ?? 0) || m.units !== (mainBefore?.units ?? 0))
+          if (busy) {
+            const moved = withNow(p, t)
+            const after = m?.isRunning ? withAgent(moved, 'main', a => finished(moved, a)) : moved
+            return { ...after, isRunning: anyRunning(after), current: null }
+          }
+          if (tookBack) return withNow(withJobOf(p, undo), Math.max(t, undo.now))
+          const agents = mainBefore
+            ? p.agents.map(a => (a.id === 'main' ? mainBefore : a))
+            : p.agents.filter(a => a.id !== 'main')
+          return { ...p, agents, isRunning: agents.some(a => a.isRunning) }
+        })
+        if (!q.isRunning) stopTicker()
+        $.ui.status(statusLine(q))
+      } catch {
+        // ignore: the next prompt starts a job anyway
+      }
+    }
+    return r
   }).catch(($, e, next) => next(e)) // if this mod breaks, your prompt still goes through
 
   // ── An agent starts working (main loop or a helper) ─────────────────────
@@ -1885,9 +2258,26 @@ export const register: Register = (on, options) => {
     const id = e.agentId ?? 'main'
     const now = await $.clock.now()
     const name = (e.agentId && (await agentName($, e.agentId))) || (id === 'main' ? 'Main' : 'Helper')
-    const after = await update($, live, p =>
+    // main's turn with no job on: a slash command or skill that asks the model (/feature, /review)
+    // starts its own job here, as a prompt you typed does (a typed prompt's job is on by now). A
+    // turn without text (a continuation, as after a Stop hook) goes on with the last job
+    const before = await read($, live)
+    const fresh = !e.agentId && !before.isRunning && e.text !== ''
+    const usage = fresh ? await readUsage($) : null
+    let alerts: string[] = []
+    let was: Record<string, number> = {}
+    const after = await update($, live, p0 => {
+      // update may run this more than once: only the last run's outcome counts
+      alerts = []
+      was = p0.alerted
+      let p = p0
+      if (fresh && !p0.isRunning) {
+        const r = jobFrom(p0, now, usage)
+        p = r.next
+        alerts = r.alerts
+      }
       // a job that had ended (a background helper carries on) or stood idle: the gap doesn't count
-      withAgent({ ...withWorking(withNow(p, now), id, now), isRunning: true }, id, a => {
+      return withAgent({ ...withWorking(withNow(p, now), id, now), isRunning: true }, id, a => {
         const goingOn = a.isRunning && a.endedAt === null && a.startedAt
         return {
           ...a,
@@ -1900,10 +2290,13 @@ export const register: Register = (on, options) => {
           thisJob: true,
           seenAt: null,
         }
-      }),
-    )
+      })
+    })
+    shout($, alerts, was, after)
     // the clock ticks again, even if the job had ended
     startTicker($)
+    // a command's job brings its rows (the Context meter, a limit): an open panel takes them
+    if (fresh) await resizeIfChanged($, before, after, cfg)
 
     // a helper appeared → show the panel, tall enough for every agent: only with autoOpen on, in
     // fullscreen (as the band or a command said; an unknown layout counts as not), and never after
@@ -1929,18 +2322,17 @@ export const register: Register = (on, options) => {
         const known = (await read($, live)).agents.find(a => a.id === id)
         const name = e.agentId && (!known || known.name === 'Helper') ? await agentName($, e.agentId) : undefined
         // no reading (the engine refused): the step's tokens, model and context still count
-        let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
-        try {
-          usage = await $.session.usage()
-        } catch {
-          // ignore
-        }
+        const usage = await readUsage($)
         const now = await $.clock.now()
         const fresh = freshTokens(u)
         let alerts: string[] = []
+        let was: Record<string, number> = {}
+        // a stand-in like "<synthetic>" (or none) isn't a model: the agent keeps the one it had
+        const model = u.model && !/^<.*>$/.test(u.model) ? u.model : undefined
         // the first request brings the last request row (and a reading may bring meters): an open panel takes them
         const before = await read($, live)
         const p = await update($, live, p => {
+          was = p.alerted
           const counted = withWorking(withLedger({ ...p, window: usage?.context.window || p.window }, usage?.cost?.usd ?? null), id, now)
           const base = withAgent(
             { ...counted, jobTokens: counted.jobTokens + fresh, sessionTokens: counted.sessionTokens + fresh },
@@ -1948,7 +2340,7 @@ export const register: Register = (on, options) => {
             a => ({
               ...a,
               name: name ?? a.name,
-              model: u.model,
+              model: model ?? a.model,
               context: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens,
               units: a.units + unitsOf(u),
               tokens: a.tokens + fresh,
@@ -1961,7 +2353,7 @@ export const register: Register = (on, options) => {
           return r.next
         })
         $.ui.status(statusLine(p))
-        for (const a of alerts) $.ui.toast(a)
+        shout($, alerts, was, p)
         await resizeIfChanged($, before, p, cfg)
         await saveSoon($)
       }
@@ -1994,13 +2386,15 @@ export const register: Register = (on, options) => {
     try {
       const failed = ran.deny !== undefined || ran.isError === true
       const result = (ran.result ?? {}) as Record<string, any>
-      await update($, live, p => ({
+      const after = await update($, live, p => ({
         ...p,
         // another call that started meanwhile keeps showing
         current: p.current === mine ? null : p.current,
         // a helper's own TodoWrite list isn't main's to-do list (the shared tasks still count)
         todos: failed || (e.agentId && e.tool === 'TodoWrite') ? p.todos : nextTodos(p.todos, e.tool, input, result),
       }))
+      // the status line drops the call too (also when the job ended while it ran)
+      $.ui.status(statusLine(after))
     } catch {
       // the tool already ran: its result goes back as it is
     }
@@ -2012,18 +2406,15 @@ export const register: Register = (on, options) => {
     const id = e.agentId ?? 'main'
     const now = await $.clock.now()
     // no reading (the engine refused): the agent still finishes, without this last reading
-    let usage: Awaited<ReturnType<EngineInterface['session']['usage']>> | null = null
-    try {
-      usage = await $.session.usage()
-    } catch {
-      // ignore
-    }
+    const usage = await readUsage($)
 
     let wasRunning = false
     let alerts: string[] = []
+    let was: Record<string, number> = {}
     const p = await update($, live, p => {
       wasRunning = p.isRunning
       alerts = []
+      was = p.alerted
       // the last reading of this turn: limits (and the forecast) and the cost, before it ends
       const ended = withNow(p, now)
       const r = usage
@@ -2041,7 +2432,7 @@ export const register: Register = (on, options) => {
       return b.next
     })
     $.ui.status(statusLine(p))
-    for (const a of alerts) $.ui.toast(a)
+    shout($, alerts, was, p)
 
     // everyone is done → stop the clock and celebrate (once: the poll may have ended the job already)
     if (!p.isRunning) {
@@ -2064,14 +2455,16 @@ export const register: Register = (on, options) => {
       const now = await $.clock.now()
       const before = await read($, live)
       let alerts: string[] = []
+      let was: Record<string, number> = {}
       const p = await update($, live, p => {
         alerts = []
+        was = p.alerted
         const r = withUsage(p, e.rateLimits, e.context.percent, now)
         alerts = r.alerts
         return r.next
       })
       $.ui.status(statusLine(p))
-      for (const a of alerts) $.ui.toast(a)
+      shout($, alerts, was, p)
       // a meter came or went (the 5h or weekly limit): an open panel takes its new height
       await resizeIfChanged($, before, p, cfg)
       void refreshSpend($, cfg)
@@ -2092,16 +2485,17 @@ export const register: Register = (on, options) => {
     if (typeof e.viewport?.isFullscreen === 'boolean') fullscreen = e.viewport.isFullscreen
     const p = await read($, live)
     const m = main(p)
-    if (e.props.hasSurvey || !m) return next(e)
+    // nothing yet: no agent and no cost (a session resumed from its record shows its totals at once)
+    if (e.props.hasSurvey || (sessionAgents(p) === 0 && p.sessionCost === 0)) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const width = Math.max(30, e.props.bodyColumns - 4)
+    const width = Math.max(1, e.props.bodyColumns - 4)
 
     // the to-do list, if Claude has one: "1/2 tasks", and the task on the go (unless the activity shows it)
     const done = p.todos.filter(t => t.status === 'completed').length
     const active = p.todos.find(t => t.status === 'in_progress')
     const doing = activity(p)
-    const task = active ? active.activeForm || active.content : ''
+    const task = active ? oneLine(active.activeForm || active.content) : ''
     const tasks = p.todos.length
       ? `  ·  ${done}/${p.todos.length} tasks${task && !doing.includes(task) ? `  ·  ${task}` : ''}`
       : ''
@@ -2117,87 +2511,117 @@ export const register: Register = (on, options) => {
 
     // line 1: the header; the badge, then the name (when shown), then the dim private-mode hint get
     // what's left of it, or go (the hint whole or not at all)
-    const model = m.model ? prettyModel(m.model) : '…'
-    const cost = p.budget === null ? money(totalCost(p)) : budgetText(p)
-    // when it doesn't fit, it drops the word "tokens", then the clock, then the model; never the
-    // cost or the title, so at the 30-column floor a long budget cost can still run past the band
-    const headerAt = (drop: number): string[] =>
-      [
-        '◉ Usage Radar',
-        drop < 3 ? `✳ ${model}` : '',
-        `# ${k(p.sessionTokens)}${drop < 1 ? ' tokens' : ''}`,
-        cost,
-        drop < 2 ? `⏱ ${sessionClock(p)}` : '',
+    const model = m?.model ? prettyModel(m.model) : '…'
+    const tokens = k(p.sessionTokens)
+    // when it doesn't fit it gives way, a step at a time: the word "tokens", the clock, the model,
+    // "Usage" in the title, the tokens, the budget (the cost alone, still in the budget's colour),
+    // "Radar"; at last the cost is cut. It never wraps
+    const headerAt = (step: number) => {
+      const plain = money(totalCost(p))
+      const shape = {
+        title: step >= 7 ? '◉' : step >= 4 ? '◉ Radar' : '◉ Usage Radar',
+        model: step < 3,
+        tokens: step < 5,
+        tokensWord: step < 1,
+        clock: step < 2,
+        cost: step >= 6 || p.budget === null ? plain : budgetText(p),
+      }
+      const parts = [
+        shape.title,
+        shape.model ? `✳ ${model}` : '',
+        shape.tokens ? `# ${tokens}${shape.tokensWord ? ' tokens' : ''}` : '',
+        shape.cost,
+        shape.clock ? `⏱ ${sessionClock(p)}` : '',
       ].filter(Boolean)
-    let drop = 0
-    while (drop < 3 && headerAt(drop).join('   ').length > width) drop++
-    let room = width - headerAt(drop).join('   ').length - 3
+      return { ...shape, span: parts.reduce((s, x) => s + cols(x), 0) + 3 * (parts.length - 1) }
+    }
+    let step = 0
+    while (step < 7 && headerAt(step).span > width) step++
+    const fitted = headerAt(step)
+    const head = fitted.span <= width ? fitted : { ...fitted, cost: fit(fitted.cost, width - cols(fitted.title) - 3) }
+    const headSpan = head === fitted ? head.span : cols(head.title) + (head.cost ? 3 + cols(head.cost) : 0)
+    let room = width - headSpan - 3
     const badge = badgeFor(p, cfg)
     const badgeText = badge && room >= 6 ? fit(badge.text, room) : null
-    if (badgeText !== null) room -= badgeText.length + 3
+    if (badgeText !== null) room -= cols(badgeText) + 3
     const shownName = nameShown(p, cfg)
     const name = shownName && room >= 6 ? fit(shownName, Math.min(28, room)) : null
-    const used =
-      headerAt(drop).join('   ').length + (badgeText !== null ? 3 + badgeText.length : 0) + (name !== null ? 3 + name.length : 0)
-    const hint = !!badge?.hasEmail && badgeText === badge.text && used + 1 + HINT.length <= width
+    const used = headSpan + (badgeText !== null ? 3 + cols(badgeText) : 0) + (name !== null ? 3 + cols(name) : 0)
+    const hint = !!badge?.hasEmail && badgeText === badge.text && used + 1 + cols(HINT) <= width
 
-    // line 2: what's going on, then the steps, helpers, tasks and the last request (dim, once there is one)
-    const doingText = fit(doing, Math.max(10, width - 40))
+    // line 2: what's going on, then the steps, helpers, tasks and the last request (dim, once there
+    // is one); the tail only when there's room for some of it
+    const doingText = fit(doing, Math.max(Math.min(10, width - 2), width - 40))
     const last = hasRequest(p) ? `  ·  ${lastRequest(p)}` : ''
-    const tail = fit(`  ·  ${plural(p.sessionSteps, 'step')}${crew}${tasks}${last}`, Math.max(0, width - 2 - doingText.length))
+    const tailRoom = width - 2 - cols(doingText)
+    const tail = tailRoom >= 5 ? fit(`  ·  ${plural(p.sessionSteps, 'step')}${crew}${tasks}${last}`, tailRoom) : ''
 
-    // line 3: the meters that fit
-    const shown = bandMeters(p, width)
+    // line 3: the meters that fit (or, too narrow for the first in full, all of them in few words)
+    const { shown, compact } = bandMeters(p, width)
+    const worst = Math.max(0, ...shown.map(x => x.pct))
 
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
         <Box flexDirection="row" gap={3}>
-          <Text color={ORANGE} bold>
-            ◉ Usage Radar
+          <Text color={ORANGE} bold wrap="truncate-end">
+            {head.title}
           </Text>
-          {drop < 3 && (
-            <Text>
+          {head.model && (
+            <Text wrap="truncate-end">
               <Text color={ORANGE}>✳ </Text>
               <Text bold>{model}</Text>
             </Text>
           )}
-          <Text>
-            <Text dimColor># </Text>
-            <Text bold>{k(p.sessionTokens)}</Text>
-            {drop < 1 && <Text dimColor> tokens</Text>}
-          </Text>
-          <Text>
-            <Text color={p.budget === null ? AMBER : budgetColor(lvl)} bold>
-              {cost}
+          {head.tokens && (
+            <Text wrap="truncate-end">
+              <Text dimColor># </Text>
+              <Text bold>{tokens}</Text>
+              {head.tokensWord && <Text dimColor> tokens</Text>}
             </Text>
-          </Text>
-          {drop < 2 && (
-            <Text>
+          )}
+          {head.cost !== '' && (
+            <Text wrap="truncate-end">
+              <Text color={p.budget === null ? AMBER : budgetColor(lvl)} bold>
+                {head.cost}
+              </Text>
+            </Text>
+          )}
+          {head.clock && (
+            <Text wrap="truncate-end">
               <Text dimColor>⏱ </Text>
               <Text bold>{sessionClock(p)}</Text>
             </Text>
           )}
           {badge && badgeText !== null && !hint && (
-            <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
+            <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color} wrap="truncate-end">
               {badgeText}
             </Text>
           )}
           {badge && badgeText !== null && hint && (
-            <Text>
+            <Text wrap="truncate-end">
               <Text bold={!!badge.color} color={badge.color} dimColor={!badge.color}>
                 {badgeText}
               </Text>
               <Text dimColor>{` ${HINT}`}</Text>
             </Text>
           )}
-          {name !== null && <Text bold>{name}</Text>}
+          {name !== null && (
+            <Text bold wrap="truncate-end">
+              {name}
+            </Text>
+          )}
         </Box>
-        <Text>
+        <Text wrap="truncate-end">
           <Text color={p.isRunning ? ORANGE : GREEN}>{p.isRunning ? spinner(p.now) : '✓'} </Text>
           <Text>{doingText}</Text>
           <Text dimColor>{tail}</Text>
         </Text>
-        {shown.length > 0 && (
+        {shown.length > 0 && compact && (
+          <Text bold color={worst >= WARN ? levelColor(worst) : undefined} wrap="truncate-end">
+            {fit(shown.map(shortMeter).join('   '), width)}
+          </Text>
+        )}
+        {shown.length > 0 && !compact && (
           <Box flexDirection="row" gap={3}>
             {shown.map(m => {
               // the spend limit with its dollars: what's left (or over), no bar; an old reading
@@ -2206,7 +2630,7 @@ export const register: Register = (on, options) => {
               if (l) {
                 const tint = m.pct >= WARN && !m.stale ? levelColor(m.pct) : undefined
                 return (
-                  <Text key={m.key}>
+                  <Text key={m.key} wrap="truncate-end">
                     <Text dimColor>{m.label} </Text>
                     <Text bold color={tint}>
                       {l.text}
@@ -2222,7 +2646,7 @@ export const register: Register = (on, options) => {
               }
               const g = bar(m.pct / 100, BAND_BAR)
               return (
-                <Text key={m.key}>
+                <Text key={m.key} wrap="truncate-end">
                   <Text dimColor>{m.label} </Text>
                   <Text color={levelColor(m.pct)}>{g.filled}</Text>
                   <Text dimColor>{g.empty}</Text>
@@ -2273,7 +2697,7 @@ export const register: Register = (on, options) => {
     const more = earlierLine(p)
     const badge = badgeFor(p, cfg)
     // the dim private-mode hint after a shown email, only when all of it fits on the badge's line
-    const hint = !!badge?.hasEmail && badge.text.length + 1 + HINT.length <= width
+    const hint = !!badge?.hasEmail && cols(badge.text) + 1 + cols(HINT) <= width
     const name = nameShown(p, cfg)
     const lvl = p.budget === null ? 0 : budgetLevel(p.sessionCost, p.budget)
     // what's left of the spend limit gets its own tile, when the panel is wide enough for four
@@ -2325,7 +2749,7 @@ export const register: Register = (on, options) => {
             const l = look(a)
             const detail = `  ${k(l.tokens)} · ${l.took}${l.isPaused ? ' · idle' : ''}`
             const price = money(l.cost)
-            const nameRoom = Math.max(6, width - l.icon.length - detail.length - price.length - 1)
+            const nameRoom = Math.max(6, width - cols(l.icon) - cols(detail) - cols(price) - 1)
             return (
               <Box key={a.id} flexDirection="row" justifyContent="space-between">
                 <Text>
@@ -2384,7 +2808,7 @@ export const register: Register = (on, options) => {
               const pace = m.left !== null ? ` · ${leftText(m.left)} at this pace` : ''
               // the dollars get what's left of the line after the label, the forecast and the percent:
               // "$87.60 left" (or "$3.50 over"), and "$12.40 of $100 used" on a line of its own
-              const room = width - m.label.length - 2 - pace.length - level.length - 1
+              const room = width - cols(m.label) - 2 - cols(pace) - cols(level) - 1
               const l = m.spend ? spendLeft(m.spend) : null
               const word = l ? ` ${l.title.toLowerCase()}` : ''
               return (
@@ -2392,14 +2816,14 @@ export const register: Register = (on, options) => {
                   <Box flexDirection="row" justifyContent="space-between">
                     <Text>
                       {m.label}
-                      {l && room >= l.text.length + word.length && (
+                      {l && room >= cols(l.text + word) && (
                         <Text>
                           {'  '}
                           <Text bold>{l.text}</Text>
                           <Text dimColor>{word}</Text>
                         </Text>
                       )}
-                      {l && room > 1 && room < l.text.length + word.length && <Text bold>{'  ' + fit(l.text + word, room)}</Text>}
+                      {l && room > 1 && room < cols(l.text + word) && <Text bold>{'  ' + fit(l.text + word, room)}</Text>}
                       {pace !== '' && <Text dimColor>{pace}</Text>}
                     </Text>
                     <Text bold color={levelColor(m.pct)}>

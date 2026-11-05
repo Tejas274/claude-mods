@@ -57,6 +57,14 @@ export type Account = { email: string | null; org: string | null }
 /** The account's dollar spend limit, from Anthropic's usage endpoint (major units; never saved) */
 export type Spend = { used: number; cap: number; currency: string; pct: number }
 
+/**
+ * One plan or spend limit's warning already shown, as shared under the store key `alerts`
+ * ({ five_hour, seven_day, spend_limit }), so another terminal in the config dir doesn't warn
+ * again: the level (80, 95, or 0 after a reset), the limit's reset time when known, and when it
+ * was written. Never dollars, the account or the context.
+ */
+export type SharedAlert = { level: number; resetsAt?: string; at: number }
+
 /** One forecast sample: working time (ms) and the % that rose while working, up to then */
 export type Sample = { at: number; rise: number }
 
@@ -91,8 +99,10 @@ export type Saved = {
  * helper agent are done; job fields (steps, costUsd/baseCost, jobTokens, startedAt) start
  * over each job. Session fields (sessionId, name, sessionCost, sessionTokens, priorMs,
  * sessionSteps, helperIds, agents, earlier) add up over the whole session and are saved,
- * with the budget (budget, budgetFired). Pace, account and spend live only in memory;
- * private mode lives in memory too, and under its own store key (`private`: true or false).
+ * with the budget (budget, budgetFired); a session with nothing in it is not saved. Pace,
+ * account and spend live only in memory; private mode lives in memory too, and under its own
+ * store key (`private`: true or false); the plan and spend limits' warning levels too, under
+ * `alerts` (see SharedAlert).
  */
 export type Live = {
   isRunning: boolean
@@ -110,7 +120,8 @@ export type Live = {
   limits: Limit[]
   /** main context fill, 0-100 */
   contextPct: number | null
-  /** highest alert level already shown per meter (80 or 95), so each alert pops once */
+  /** highest alert level already shown per meter (80 or 95), so each alert pops once; at start the
+   *  plan and spend limits' levels another terminal shared (`alerts`) are taken */
   alerted: Record<string, number>
   /** the session these totals belong to (null until we know it) */
   sessionId: string | null
@@ -140,9 +151,10 @@ export type Live = {
   budgetFired: number
   /** how fast each limit is filling while working, for the forecast (not saved) */
   pace: Pace
-  /** the signed-in account, read once per process (null until read; not saved) */
+  /** the signed-in account, read at start and again once a minute (null until read; not saved) */
   account: Account | null
-  /** the account's spend limit in dollars, read from Anthropic once a minute (null: none; not saved) */
+  /** the account's spend limit in dollars, read from Anthropic once a minute while working, every
+   *  5 minutes while idle (null: none; not saved) */
   spend: Spend | null
   /** the spend reading is over 10 minutes old (checks failing or held back); not saved */
   spendStale: boolean

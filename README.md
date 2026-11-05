@@ -62,7 +62,7 @@ for a team: drop this in your repo's `.claude/settings.json` and everyone who op
 
 if your company manages claude code settings, an admin might need to allow outside marketplaces first.
 
-usage-radar reads your usage from anthropic with claude code's own login, once a minute (turn it off with `showSpend`), and nothing goes anywhere else. turn-receipt only reads what claude code already gives it, nothing gets sent anywhere.
+usage-radar reads your usage from anthropic with claude code's own login, once a minute while working, every 5 minutes idle (turn it off with `showSpend`), and nothing goes anywhere else. turn-receipt only reads what claude code already gives it, nothing gets sent anywhere.
 
 ### making one
 
