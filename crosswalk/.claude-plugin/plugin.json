@@ -1,0 +1,28 @@
+{
+  "name": "crosswalk",
+  "version": "1.0.0",
+  "description": "Warns you (never blocks) when Claude is about to edit a file that's also changed in an open GitHub pull request: a line above the prompt and a one-time toast. /crosswalk lists the files your branch shares with open PRs.",
+  "types": "./types/index.d.ts",
+  "author": { "name": "Tejas Shah" },
+  "license": "MIT",
+  "userConfig": {
+    "showTitles": {
+      "type": "boolean",
+      "title": "Show PR titles",
+      "description": "Show the pull request's title in the band and the toast (cleaned and cut short). Never sent to Claude.",
+      "default": true
+    },
+    "showAuthors": {
+      "type": "boolean",
+      "title": "Show PR authors",
+      "description": "Show who opened the pull request in the band, the toast and /crosswalk.",
+      "default": true
+    },
+    "includeMine": {
+      "type": "boolean",
+      "title": "Include my own PRs",
+      "description": "Also warn about pull requests you opened yourself (the one for your current branch is always skipped).",
+      "default": false
+    }
+  }
+}
