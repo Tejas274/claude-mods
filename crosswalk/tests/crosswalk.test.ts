@@ -2,8 +2,8 @@ import { expect, test } from 'claude-code/testing'
 
 import { HOUR, MIN, NOW, band, bandLines, begin, clear, crosswalk, edit, listCalls, pr, prompt, ready, world } from './world'
 
-const OFF_GH = "crosswalk: gh isn't available or not logged in here"
-const OFF_REPO = "crosswalk: this folder isn't a GitHub repository with a single remote, so crosswalk is off here"
+const OFF_GH = "gh isn't available or not logged in here"
+const OFF_REPO = "this folder isn't a GitHub repository with a single remote, so crosswalk is off here"
 
 // ════════════════════════════════════════════════════════════════════════════
 // The band and the toast
@@ -337,7 +337,7 @@ test('/crosswalk lists committed and uncommitted overlaps, sorted, with the trun
   const { text } = await crosswalk($)
   expect(text).toBe(
     [
-      'crosswalk: 3 files on this branch are also in open PRs (3 open PRs checked, read just now):',
+      '3 files on this branch are also in open PRs (3 open PRs checked, read just now):',
       'docs/a.md — #30 (alice)',
       'lib/z.ts — #22 (bob)',
       'src/app.ts — #14 (alice), #22 (bob)',
@@ -354,7 +354,7 @@ test('/crosswalk with no overlaps says so', async ($, on) => {
   const w = await ready($, on)
   w.diff = ['other.ts']
   await w.clock.advance(3 * MIN)
-  expect((await crosswalk($)).text).toBe('crosswalk: no file on this branch is in another open PR (1 open PR checked, read 3m ago).')
+  expect((await crosswalk($)).text).toBe('no file on this branch is in another open PR (1 open PR checked, read 3m ago).')
 })
 
 test('/crosswalk on a cold cache reads first', async ($, on) => {

@@ -38,9 +38,9 @@ const REPOS_MAX = 20 // repos known at once; past this the oldest goes, with wha
 const ME_RETRY_MS = 30 * 60_000 // gh not saying who I am: asked again after this
 const TITLE_COLS = 60
 
-const OFF_GH = "crosswalk: gh isn't available or not logged in here"
-const OFF_REPO = "crosswalk: this folder isn't a GitHub repository with a single remote, so crosswalk is off here"
-const HELD = 'crosswalk: reading GitHub failed or was rate limited a moment ago; try /crosswalk again in a few minutes'
+const OFF_GH = "gh isn't available or not logged in here"
+const OFF_REPO = "this folder isn't a GitHub repository with a single remote, so crosswalk is off here"
+const HELD = 'reading GitHub failed or was rate limited a moment ago; try /crosswalk again in a few minutes'
 
 // git and gh never prompt, page, colour or check for updates
 const ENV: Record<string, string> = {
@@ -691,7 +691,7 @@ const onEdit = async ($: EngineInterface, cfg: Config, input: Record<string, unk
     toasted.add(key)
     const title = cfg.showTitles && pr.title ? ` '${pr.title}'` : ''
     const by = cfg.showAuthors ? ` by ${pr.login}` : ''
-    $.ui.toast(fit(`🚸 crosswalk: ${shownPath} is also changed in PR #${pr.number}${title}${by}`, 200))
+    $.ui.toast(fit(`🚸 ${shownPath} is also changed in PR #${pr.number}${title}${by}`, 200))
   }
 }
 
@@ -809,7 +809,7 @@ export const register: Register = (on, options) => {
           : '',
       ].filter(Boolean)
       if (hits.size === 0)
-        return { text: [`crosswalk: no file on this branch is in another open PR (${checked}).`, ...notes].join('\n') }
+        return { text: [`no file on this branch is in another open PR (${checked}).`, ...notes].join('\n') }
       const rows = [...hits]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(([p, prs]) => {
@@ -819,7 +819,7 @@ export const register: Register = (on, options) => {
             .join(', ')
           return `${clean(p, 200)} — ${list}`
         })
-      const head = `crosswalk: ${hits.size} file${hits.size === 1 ? '' : 's'} on this branch ${hits.size === 1 ? 'is' : 'are'} also in open PRs (${checked}):`
+      const head = `${hits.size} file${hits.size === 1 ? '' : 's'} on this branch ${hits.size === 1 ? 'is' : 'are'} also in open PRs (${checked}):`
       return { text: [head, ...rows, ...notes].join('\n') }
     } catch {
       return { text: OFF_GH }

@@ -296,7 +296,7 @@ test('11. a gh that hangs (rejects at its timeout) is a failed reading, not a st
   const w = world(on)
   w.list = 'throw'
   await begin($, w)
-  expect((await crosswalk($)).text).toBe("crosswalk: gh isn't available or not logged in here")
+  expect((await crosswalk($)).text).toBe("gh isn't available or not logged in here")
 })
 
 // 12. Malformed remotes turn crosswalk off
