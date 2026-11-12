@@ -14,6 +14,11 @@
       "name": "turn-receipt",
       "source": "./turn-receipt",
       "description": "An itemized receipt for every job: time and cost per agent, calls and time per tool, slowest step, biggest read, files changed, cache hit. /receipt, /receipt copy."
+    },
+    {
+      "name": "crosswalk",
+      "source": "./crosswalk",
+      "description": "Warns (never blocks) when Claude is about to edit a file that an open GitHub pull request also changes: a line above the prompt and a one-time toast. /crosswalk lists the files your branch shares with open PRs. Needs gh."
     }
   ]
 }
